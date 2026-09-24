@@ -1,0 +1,37 @@
+name: lint-test
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
+        with:
+          go-version-file: go.mod
+
+      - name: Check formatting
+        run: make fmt-check
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9
+        with:
+          version: v2.13.2
+
+      - name: Unit and Docker integration tests
+        run: make test-integration
+
+      - name: Build release snapshot
+        uses: goreleaser/goreleaser-action@ec59f474b9834571250b370d4735c50f8e2d1e29 # v7
+        with:
+          version: v2.18.2
+          args: release --snapshot --clean --skip=publish
