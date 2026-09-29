@@ -72,6 +72,14 @@ metadata, and text-only models stop the run before a report is created.
 Reports retain the OCR text by default so it can be inspected or analyzed later.
 Use `--include-text=false` if only findings should be retained.
 
+Requests run sequentially, with a **two-second pause before every Ollama inference
+request**, including the first OCR call and each assessment call. Use
+`--request-delay 5s` for a longer pause or `--request-delay 0` to disable it.
+The pause is shown in progress output, responds to Ctrl+C, and does not count
+toward the request timeout. It also applies after a failed request before the
+next inference attempt. Model capability checks and Houdini requests are not
+delayed; completed page records are saved immediately.
+
 ## Progress and debugging
 
 Progress on stderr shows the document filename, page number/total, and active

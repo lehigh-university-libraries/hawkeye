@@ -29,7 +29,7 @@ const defaultImage = "islandora/houdini@sha256:22f87ca3232b7edccfb0b0c4d769c77f9
 type options struct {
 	depth, dpi, maxEdge, numCtx                               int
 	endpoint, model, analysisModel, image, houdiniURL, output string
-	timeout                                                   time.Duration
+	timeout, requestDelay                                     time.Duration
 	includeText, noRegex                                      bool
 	progress                                                  io.Writer
 	logger                                                    *slog.Logger
@@ -155,6 +155,7 @@ func newCommand() *cobra.Command {
 	f.IntVar(&o.dpi, "dpi", 200, "PDF render DPI")
 	f.IntVar(&o.maxEdge, "max-edge", 2400, "Maximum image edge in pixels; 0 preserves rendered size")
 	f.DurationVar(&o.timeout, "timeout", 5*time.Minute, "Timeout for each conversion or API request")
+	f.DurationVar(&o.requestDelay, "request-delay", 2*time.Second, "Pause before each Ollama inference request; 0 disables the pause")
 	f.StringVarP(&o.output, "output", "o", "hawkeye-report.jsonl", "JSONL report to create or resume, or - for stdout")
 	f.BoolVar(&o.includeText, "include-text", true, "Retain OCR text in report; use --include-text=false to omit it")
 	f.BoolVar(&o.noRegex, "no-regex", false, "Disable text rules; retain model assessment")
@@ -273,6 +274,9 @@ func run(ctx context.Context, path string, o options, stdout, stderr io.Writer) 
 	if o.numCtx < 0 {
 		return errors.New("num-ctx must be nonnegative; 0 uses the server/model default")
 	}
+	if o.requestDelay < 0 {
+		return errors.New("request-delay must be nonnegative; 0 disables the pause")
+	}
 	if err := validateURL(o.endpoint); err != nil {
 		return err
 	}
@@ -309,7 +313,7 @@ func run(ctx context.Context, path string, o options, stdout, stderr io.Writer) 
 	if err := os.Setenv("OLLAMA_URL", strings.TrimRight(o.endpoint, "/")); err != nil {
 		return err
 	}
-	o.debug("Scan configuration", "ollama_url", o.endpoint, "model", o.model, "analysis_model", o.analysisModel, "num_ctx", o.numCtx, "houdini_url", o.houdiniURL, "docker_image", o.image, "dpi", o.dpi, "max_edge", o.maxEdge, "timeout", o.timeout, "documents", len(files))
+	o.debug("Scan configuration", "ollama_url", o.endpoint, "model", o.model, "analysis_model", o.analysisModel, "num_ctx", o.numCtx, "houdini_url", o.houdiniURL, "docker_image", o.image, "dpi", o.dpi, "max_edge", o.maxEdge, "timeout", o.timeout, "request_delay", o.requestDelay, "documents", len(files))
 	models := []string{o.model, o.analysisModel}
 	if remaining == 0 {
 		models = nil
@@ -470,6 +474,21 @@ func scanPage(ctx context.Context, file string, page, count int, o options) resu
 }
 
 func (o options) extract(ctx context.Context, file, encoded, stage, model, prompt string, format json.RawMessage) (string, error) {
+	// Requests are sequential. Waiting here also spaces requests after failures,
+	// without delaying the durable save of a completed page.
+	if o.requestDelay > 0 {
+		stop := o.startProgress(fmt.Sprintf("Waiting %s before %s", o.requestDelay, stage))
+		timer := time.NewTimer(o.requestDelay)
+		select {
+		case <-ctx.Done():
+		case <-timer.C:
+		}
+		timer.Stop()
+		stop()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	stop := o.startProgress(fmt.Sprintf("%s (%s)", stage, model))
 	defer stop()
 	requested := time.Now()

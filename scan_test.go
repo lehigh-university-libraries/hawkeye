@@ -621,6 +621,53 @@ func TestPageAssessmentAndFailures(t *testing.T) {
 	}
 }
 
+func TestRequestDelay(t *testing.T) {
+	cmd := newCommand()
+	delay, err := cmd.Flags().GetDuration("request-delay")
+	if err != nil || delay != 2*time.Second {
+		t.Fatalf("default request delay = %s, err = %v", delay, err)
+	}
+	cmd.SetArgs([]string{"--request-delay=-1s"})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "request-delay must be nonnegative") {
+		t.Fatalf("negative request delay was not rejected: %v", err)
+	}
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, `{"response":"synthetic text"}`)
+	}))
+	defer server.Close()
+	t.Setenv("OLLAMA_URL", server.URL)
+	var progress bytes.Buffer
+	o := options{requestDelay: 20 * time.Millisecond, timeout: time.Second, progress: &progress}
+	for i, stage := range []string{"OCR", "Assessment", "OCR"} {
+		started := time.Now()
+		_, err := o.extract(context.Background(), "synthetic.png", "", stage, "test", "test", nil)
+		if (err != nil) != (i == 0) {
+			t.Fatalf("request %d: %v", i, err)
+		}
+		if time.Since(started) < o.requestDelay {
+			t.Fatalf("request %d did not wait", i)
+		}
+	}
+	if !strings.Contains(progress.String(), "Waiting 20ms before Assessment") {
+		t.Fatalf("missing wait progress: %s", progress.String())
+	}
+	o.requestDelay = time.Hour
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := o.extract(ctx, "synthetic.png", "", "OCR", "test", "test", nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wait did not return context error: %v", err)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("canceled wait sent a request: %d calls", calls.Load())
+	}
+}
+
 func TestContextWindow(t *testing.T) {
 	imageData := testPNG(t)
 	input := filepath.Join(t.TempDir(), "page.png")
