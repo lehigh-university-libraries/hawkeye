@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/lehigh-university-libraries/htr/pkg/providers"
 )
 
 func TestReportCheckpointSurvivesKill(t *testing.T) {
@@ -496,6 +499,13 @@ func TestDebugLevelAndErrorRedaction(t *testing.T) {
 			t.Fatalf("incorrect/redaction-unsafe error: %s", got)
 		}
 	}
+	for _, kind := range []providers.ErrorKind{providers.ErrorInvalidRequest, providers.ErrorInvalidResponse, providers.ErrorTransport, providers.ErrorTimeout, providers.ErrorCanceled, providers.ErrorUpstream} {
+		err := fmt.Errorf("wrapped: %w", providers.NewError(kind, 503, false, errors.New("secret document text")))
+		got := ollamaFailure(err)
+		if !strings.Contains(got, string(kind)) || !strings.Contains(got, "503") || strings.Contains(got, "secret document text") {
+			t.Fatalf("lost typed error details or leaked content: %s", got)
+		}
+	}
 }
 
 func syntheticPDF() []byte {
@@ -535,7 +545,7 @@ func TestPageAssessmentAndFailures(t *testing.T) {
 		includeText, noRegex           bool
 	}{
 		{"no findings", "A letter about the garden.", "", "no_findings", false, false},
-		{"empty OCR", "", "", "review", true, false},
+		{"empty OCR", "", "", "error", true, false},
 		{"include text", "A letter about the garden.", "", "no_findings", true, false},
 		{"visual finding", "Unremarkable OCR.", `{"contains_sensitive":true,"readable":true,"sensitive_likelihood_percent":80,"kinds":["bank_account"]}`, "review", true, false},
 		{"rules survive model negative", "Account number: 12345678", "", "review", true, false},
@@ -596,8 +606,15 @@ func TestPageAssessmentAndFailures(t *testing.T) {
 			defer server.Close()
 			t.Setenv("OLLAMA_URL", server.URL)
 			got := scanPage(ctx, input, 1, 1, options{model: "test-ocr", analysisModel: "test-analysis", houdiniURL: server.URL + "/image", timeout: time.Second, includeText: tc.includeText, noRegex: tc.noRegex})
-			if calls.Load() != 2 {
-				t.Fatalf("expected separate OCR and assessment calls, got %d", calls.Load())
+			wantCalls := int32(2)
+			if tc.text == "" {
+				wantCalls = 1 // HTR rejects an empty response before assessment.
+				if !strings.Contains(got.Error, "invalid_response") {
+					t.Fatalf("missing empty-response diagnostic: %s", got.Error)
+				}
+			}
+			if calls.Load() != wantCalls {
+				t.Fatalf("expected %d model calls, got %d", wantCalls, calls.Load())
 			}
 			if got.Status != tc.status {
 				t.Fatalf("got %+v", got)
@@ -644,9 +661,10 @@ func TestRequestDelay(t *testing.T) {
 	t.Setenv("OLLAMA_URL", server.URL)
 	var progress bytes.Buffer
 	o := options{requestDelay: 20 * time.Millisecond, timeout: time.Second, progress: &progress}
+	encoded := base64.StdEncoding.EncodeToString(testPNG(t))
 	for i, stage := range []string{"OCR", "Assessment", "OCR"} {
 		started := time.Now()
-		_, err := o.extract(context.Background(), "synthetic.png", "", stage, "test", "test", nil)
+		_, err := o.extract(context.Background(), encoded, stage, "test", "test", nil)
 		if (err != nil) != (i == 0) {
 			t.Fatalf("request %d: %v", i, err)
 		}
@@ -660,7 +678,7 @@ func TestRequestDelay(t *testing.T) {
 	o.requestDelay = time.Hour
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if _, err := o.extract(ctx, "synthetic.png", "", "OCR", "test", "test", nil); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := o.extract(ctx, encoded, "OCR", "test", "test", nil); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("wait did not return context error: %v", err)
 	}
 	if calls.Load() != 3 {

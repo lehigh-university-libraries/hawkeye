@@ -54,6 +54,14 @@ func debugLogger(w io.Writer, rawLevel string) (*slog.Logger, error) {
 // HTR includes server response bodies in some errors. Translate those cases
 // instead of logging raw errors, even at DEBUG level.
 func ollamaFailure(err error) string {
+	var providerError *providers.Error
+	if errors.As(err, &providerError) {
+		// HTR's typed errors are already redacted and retain category/status.
+		if providerError.StatusCode >= 400 {
+			return fmt.Sprintf("Ollama HTTP %d (%s; check the Ollama server logs)", providerError.StatusCode, providerError.Kind)
+		}
+		return "Ollama " + providerError.Error()
+	}
 	message := err.Error()
 	if strings.HasPrefix(message, "ollama API error: ") {
 		status, _, _ := strings.Cut(strings.TrimPrefix(message, "ollama API error: "), " - ")
@@ -435,7 +443,7 @@ func scanPage(ctx context.Context, file string, page, count int, o options) resu
 	}
 	o.debug("Image prepared", "page", page, "image_bytes", len(data))
 	encoded := base64.StdEncoding.EncodeToString(data)
-	text, err := o.extract(ctx, file, encoded, "OCR", o.model, ocrPrompt, nil)
+	text, err := o.extract(ctx, encoded, "OCR", o.model, ocrPrompt, nil)
 	if err != nil {
 		r.Error = fmt.Sprintf("OCR request failed: %s; page requires review", ollamaFailure(err))
 		return r
@@ -452,7 +460,7 @@ func scanPage(ctx context.Context, file string, page, count int, o options) resu
 		r.Findings = append(r.Findings, finding{Kind: "empty_ocr", Source: "ocr"})
 	}
 	quoted, _ := json.Marshal(text) // A string is always JSON-encodable.
-	raw, err := o.extract(ctx, file, encoded, "Assessment", o.analysisModel, analysisPrompt+string(quoted), json.RawMessage(assessmentSchema))
+	raw, err := o.extract(ctx, encoded, "Assessment", o.analysisModel, analysisPrompt+string(quoted), json.RawMessage(assessmentSchema))
 	if err != nil {
 		r.Error = fmt.Sprintf("assessment request failed: %s; page requires review", ollamaFailure(err))
 		return r
@@ -473,7 +481,7 @@ func scanPage(ctx context.Context, file string, page, count int, o options) resu
 	return r
 }
 
-func (o options) extract(ctx context.Context, file, encoded, stage, model, prompt string, format json.RawMessage) (string, error) {
+func (o options) extract(ctx context.Context, encoded, stage, model, prompt string, format json.RawMessage) (string, error) {
 	// Requests are sequential. Waiting here also spaces requests after failures,
 	// without delaying the durable save of a completed page.
 	if o.requestDelay > 0 {
@@ -498,7 +506,9 @@ func (o options) extract(ctx context.Context, file, encoded, stage, model, promp
 		// response. Request only the assessment; never parse a reasoning trace.
 		config.Think = new(bool)
 	}
-	text, usage, err := ollama.New().ExtractText(ctx, config, file, encoded)
+	// Omit the source filename: HTR must detect the prepared image's MIME type
+	// from its bytes, not reject a rendered page because its source was a PDF.
+	text, usage, err := ollama.New().ExtractText(ctx, config, "", encoded)
 	// HTR errors may contain document data; log only the sanitized description.
 	if err != nil {
 		o.debug("Model request failed", "stage", stage, "model", model, "elapsed", time.Since(requested), "error", ollamaFailure(err))
