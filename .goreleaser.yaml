@@ -23,6 +23,9 @@ builds:
 
 archives:
   - formats: [tar.gz]
+    files:
+      - README.md
+      - third_party/htr/LICENSE
     name_template: >-
       {{ .ProjectName }}_
       {{- title .Os }}_

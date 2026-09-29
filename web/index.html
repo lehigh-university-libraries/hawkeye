@@ -1,0 +1,7 @@
+{{template "head" .}}
+<main id="content"><div class="intro"><p class="eyebrow">Reports</p><h1>Collections at a glance</h1><p>Open a directory to review saved scan results. New records appear as reports are written.</p></div>
+{{if .Reports}}<div class="table-wrap"><table><thead><tr><th>Directory / report</th><th>Files with records</th><th>Complete files</th><th>Scanned pages</th><th>Review pages</th><th>Errors</th><th>Last saved</th></tr></thead>
+<tbody>{{range .Reports}}<tr><td><a class="collection" href="/report?id={{.ID}}">{{.Directory}}</a><small>{{.Name}}</small>{{if .Problem}}<small class="error">{{.Problem}}</small>{{else if .Partial}}<small>Incomplete final record</small>{{end}}</td><td>{{.Files}}</td><td>{{.CompleteFiles}}</td><td>{{.Pages}}</td><td>{{.Review}}</td><td>{{.Errors}}</td><td class="date">{{.Updated}}</td></tr>{{end}}</tbody></table></div>
+{{else}}<div class="empty"><h2>No reports yet</h2><p>Place JSONL reports or files named <code>report.json</code> in this directory or its subdirectories.</p></div>{{end}}
+<p class="note">Counts reflect saved records. Files that have not produced a record are not included; these counts do not establish overall scan coverage.</p>
+</main>{{template "foot" .}}

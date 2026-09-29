@@ -1,0 +1,12 @@
+{{template "head" .}}
+<main id="content"><a class="back" href="/">← All collections</a><div class="intro"><p class="eyebrow">{{.Report.Name}}</p><h1>{{.Report.Directory}}</h1><p>Last saved: {{.Report.Updated}}</p></div>
+{{if .Report.Problem}}<div class="notice error" role="alert">{{.Report.Problem}}</div>{{else}}
+{{if .Report.Partial}}<div class="notice">The final record is incomplete, either from an active write or an interruption. Showing complete records only.</div>{{end}}
+<section class="metrics" aria-label="Saved progress"><div><strong>{{.Report.CompleteFiles}}</strong><span>complete files</span></div><div><strong>{{.Report.Pages}}</strong><span>scanned pages</span></div><div><strong>{{.Report.Review}}</strong><span>pages to review</span></div><div><strong>{{.Report.Errors}}</strong><span>processing errors</span></div></section>
+<p class="note">{{.Report.Files}} files have saved records. Unseen files are not counted. “Complete” means processing finished, including files needing review.</p>
+<div class="toolbar"><nav aria-label="Page filter"><a {{if not .All}}aria-current="page"{{end}} href="/report?id={{.Report.ID}}">Needs attention</a><a {{if .All}}aria-current="page"{{end}} href="/report?id={{.Report.ID}}&amp;all=1">All saved pages</a></nav><button type="button" id="copy-table">Copy table for Sheets</button><span id="copy-status" role="status"></span></div>
+<div class="table-wrap"><table id="results"><thead><tr><th>File</th><th>Page</th><th>Status</th><th>Findings</th><th>Details</th></tr></thead><tbody>
+{{range .Report.Rows}}<tr><td class="file">{{cell .File}}</td><td>{{.Page}}</td><td>{{if eq .Status "review"}}Review{{else if eq .Status "error"}}Processing error{{else}}No findings{{end}}</td><td>{{cell .Kinds}}</td><td>{{cell .Details}}</td></tr>{{end}}
+</tbody></table></div>{{if not .Report.Rows}}<p class="empty">No saved pages match this view.</p>{{end}}
+<p class="note">Page numbers start at 1; page 0 indicates a file-level processing error. The latest attempt replaces earlier results in this view. OCR text and original documents are not served.</p>
+{{end}}</main>{{template "foot" .}}

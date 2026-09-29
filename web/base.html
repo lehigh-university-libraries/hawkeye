@@ -1,0 +1,6 @@
+{{define "head"}}<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hawkeye · Report review</title><link rel="stylesheet" href="/assets/style.css"><script src="/assets/app.js" defer></script></head>
+<body><header><a class="brand" href="/">Hawkeye</a><span>Collection review</span><span class="readonly">Read only</span></header>
+<div class="refresh"><label><input id="auto-refresh" type="checkbox" checked> Refresh every 10 seconds</label><span id="refresh-status" role="status">Pauses while text is selected.</span></div>{{end}}
+{{define "foot"}}<footer>Findings are candidates for human review. A model result does not certify a document safe to publish.</footer></body></html>{{end}}

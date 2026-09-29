@@ -1,7 +1,7 @@
 # Hawkeye
 
 Flag PDFs and images that need sensitive-information review, using on-prem OCR
-and visual assessment in one model call per page. Hawkeye identifies candidates; it does not redact
+and a separate visual assessment model. Hawkeye identifies candidates; it does not redact
 documents or certify them safe for publication.
 
 ## Install
@@ -47,12 +47,23 @@ The default model is `glm-ocr:bf16`, matching the cloned HTR evaluation. The
 endpoint defaults to `https://ollama.cc.lehigh.edu`; `OLLAMA_URL` or
 `--ollama-url` overrides it. SET must install the selected model first. All
 inference requests use `github.com/lehigh-university-libraries/htr/pkg/ollama`
-v0.17.0, the release at the reference checkout's commit. No local `replace`
-directive or changes to the HTR checkout are needed.
+v0.17.0 with a small [local patch](third_party/htr/README.md) to forward `num_ctx`, `format`, and `think`.
+The patched source is included in this repository; no separate HTR checkout is needed.
 
-Use `--model MODEL_NAME` to select the installed Ollama vision model for both
-OCR and PII assessment. Model names must match the server's installed tags.
-The previous `--analysis-model` flag has been removed.
+Each inference requests a **16,384-token context window** by default. Override
+it with `--num-ctx 32768`, or use `--num-ctx 0` to omit the request option and
+keep the server/model default. Negative values are rejected. The server's
+`OLLAMA_CONTEXT_LENGTH` sets a default, not a maximum; see the
+[Ollama API example](https://docs.ollama.com/faq#how-can-i-specify-the-context-window-size).
+Larger windows require more server memory and must fit the selected model.
+Image tokenization varies by model, so Hawkeye does not estimate context from
+image dimensions. The window must accommodate the image, prompt, full
+transcription, and assessment; 16,384 is a starting point, not a guarantee that
+every page fits. Debug logs include the requested `num_ctx`.
+
+Use `--model MODEL_NAME` to select the OCR model and `--analysis-model MODEL_NAME`
+to select the assessment model. Both must be installed Ollama vision models.
+OCR defaults to `glm-ocr:bf16`; assessment defaults to `qwen3.5:latest`.
 Before sending any documents, Hawkeye checks `/api/show` for the `vision`
 capability on the selected model. Text-only models such as `gpt-oss` cannot
 perform image OCR or the current image-based assessment; a nonempty reply from
@@ -64,8 +75,7 @@ Use `--include-text=false` if only findings should be retained.
 ## Progress and debugging
 
 Progress on stderr shows the document filename, page number/total, and active
-step: page counting, Docker rendering, Houdini preparation, or combined OCR and
-assessment.
+step: page counting, Docker rendering, Houdini preparation, or OCR, or assessment.
 During a long step, a heartbeat prints every 10 seconds with elapsed time. Each
 completed page shows its status, finding count, and duration. JSONL output on
 stdout remains separate when using `-o -`.
@@ -88,50 +98,51 @@ and missing response fields. The HTR client calls `/api/generate`: `OLLAMA_URL`
 must address the Ollama API, not an Open WebUI frontend. A useful check is
 `curl "$OLLAMA_URL/api/tags"`, which should return model-list JSON rather than HTML.
 
-## Combined OCR and model assessment
+## Separate OCR and model assessment
 
-Each page image makes exactly one inference call through HTR to the model
-selected with `--model`. A multiline prompt requests a JSON object containing
-both the complete `text` transcription and an `assessment`:
+Each page uses two inference calls through HTR:
 
-```json
-{
-  "text": "Full OCR transcription...",
-  "assessment": {
-    "contains_sensitive": true,
-    "readable": true,
-    "sensitive_likelihood_percent": 80,
-    "kinds": ["bank_account"]
-  }
-}
+1. `--model` transcribes the prepared image using the documented GLM-OCR prompt,
+   `Text Recognition:`, without a JSON schema or a request for PII judgments.
+2. `--analysis-model` independently inspects the same image and the OCR text for
+   bank accounts, routing numbers, SSNs, and credit cards. It receives an
+   [assessment-only JSON schema](assessment_schema.json). It does not rewrite
+   the saved transcription. Assessment sends `think=false` so the structured
+   result is returned as the final answer rather than reasoning output.
+
+This replaces the combined request, which produced unsupported PII claims with
+GLM-OCR. A response schema constrains structure; it does not establish accuracy.
+Both models are checked for image support before documents are processed.
+The assessment sees the image as well as the text so that an OCR omission does
+not automatically hide a visual finding. Document text is explicitly treated
+as untrusted data, not instructions.
+
+```sh
+./hawkeye ./scans --model glm-ocr:bf16 --analysis-model qwen3.5:latest \
+  --num-ctx 16384 -o report.jsonl
 ```
 
-Hawkeye keeps both in the report and also scans the returned transcription with
-rules for account-number context, bank/MICR context, routing checksums, formatted
-SSNs, and Luhn-valid card-number candidates. Findings include OCR line numbers,
-never matched values. Addresses and telephone numbers alone are not targets.
-`--no-regex` disables only those rules; the model still returns both text and
-assessment. `--include-text=false` omits the saved transcription while still
-using it for rules. The report's `ocr_model` and `analysis_model` identify the
-same selected model.
+Hawkeye independently checks the OCR using account-number and bank/MICR context,
+routing checksums, formatted SSNs, and Luhn-valid card-number rules. Findings
+contain line numbers and categories, never matched values. Addresses and phone
+numbers alone are not targets. `--no-regex` disables these rules, not either
+model call. `--include-text=false` omits the stored transcript, but both rules
+and assessment still receive it.
+
+The report keeps `text` from the OCR model and `assessment` from the assessment
+model; `ocr_model` and `analysis_model` identify each. OCR and rule findings
+remain in the page record if assessment fails, times out, or is interrupted.
+An OCR request failure skips assessment. Errors do not become `no_findings`.
 
 The percentage is an **uncalibrated model estimate**, not a measured probability.
-Review status follows findings, the model's sensitive-content flag, or its
-unreadable flag. A model negative cannot erase rule findings. Empty OCR is also
-flagged for review. Both the rules and the model can miss sensitive content.
+Any rule finding, model finding, empty OCR, or unreadable assessment results in
+review. A model negative cannot erase a rule finding. Missing fields, invalid
+JSON, or contradictory categories produce errors requiring review. Illegible
+text alone is not evidence for any particular sensitive category.
 
-The model must support images **and** the combined JSON instructions. Image
-support is checked once at startup without sending a document; this metadata
-request is not an inference call. Good OCR accuracy alone, including the earlier
-GLM-OCR evaluation, does not establish reliable combined assessment. Test the
-chosen model against representative pages before running the full collection.
-
-HTR v0.17.0 does not expose Ollama's `format` parameter. Hawkeye requests JSON in
-the prompt and validates the transcription plus all assessment fields, types,
-ranges, and categories. Plain-text replies, missing transcription, and invalid
-assessments become processing errors. A valid transcription from a JSON reply
-is retained even if the assessment is invalid. There is no automatic second
-inference or fallback call.
+Validate both models on representative pages with known findings and negatives
+before scanning the whole collection. Synthetic checks establish basic behavior,
+not accuracy on historical handwriting or a guarantee of finding all PII.
 
 ## Image preparation
 
@@ -182,8 +193,8 @@ the entire document needs review. Status values:
   Preparation errors include the cause (such as Houdini's HTTP status or Docker's
   exit status), without recording HTTP response bodies or conversion stderr.
 
-Reports are created with mode `0600`, appended record by record during the run,
-and never overwrite an existing file. Each record is synced to disk before
+Reports are created with mode `0600` and appended record by record. Passing an
+existing output file resumes that report. Each record is synced to disk before
 progress marks the page complete; the JSONL file itself is the checkpoint.
 This does not depend on shutdown handlers running. A failed write or sync stops
 the scan immediately. `-o -` writes JSONL to stdout; progress
@@ -214,21 +225,84 @@ own temporary files.
 
 An OOM kill or SIGKILL cannot run cleanup handlers. Previously synced page
 records remain available; the current page may be lost, and a kill during a
-write can leave an incomplete last line. Preserve the original report and use
-only complete JSONL records when recovering it. Hawkeye does not yet resume
-automatically. With `-o -`, flushing and durability depend on the receiving
+write can leave an incomplete last line. On resume, Hawkeye validates complete
+records and discards only an unfinished final JSON object before appending.
+Malformed complete records stop the run without changing the report. A valid
+final record missing its newline is preserved and separated from new records. With `-o -`, flushing and durability depend on the receiving
 process. An active Docker container may survive a host-process kill until its
 command finishes; `--rm` removes it when it exits. Disk or filesystem failures
 can still prevent successful checkpoints.
 
-For an interrupted run, the partial report cannot establish coverage of the
-collection; rerun to a new report. Start with known positive and negative pages
-and manually measure missed detections before trusting the review workload.
+For an interrupted run, rerun the same command with the same output report:
 
-The initial implementation is sequential, has no automatic retries or resume,
+```sh
+./hawkeye /path/to/images -o /path/to/images/report.jsonl
+# After a crash or interruption, run that same command again.
+```
+
+Resume keys are absolute file paths and one-based page numbers. The latest
+`review` or `no_findings` record completes a page; `error` records are retried.
+A review finding is a completed scan, not a processing failure. New files are
+scanned, and successful pages in partially scanned PDFs/TIFFs are skipped.
+New records include `page_count`, allowing fully completed multipage files to
+be skipped without conversion. Older single-image reports also work; older
+PDF/TIFF/GIF/WebP reports need page enumeration before completed pages can be
+skipped. If all files are complete, Docker and Ollama are not contacted.
+
+Historical records remain in the report. Retries append a new result; consumers
+should use the latest record for each `(file, page)`. A successful page record
+supersedes an older page-0 enumeration error. The web viewer applies these rules.
+The CLI summary describes work performed in this invocation and lists skips.
+`-o -` does not resume. Use only one scanner per report at a time.
+
+Resume assumes source files and scan settings have not changed. It does not
+invalidate results when a file, prompt, model, or detection rule changes.
+**Use a new report to reevaluate earlier results**, including false positives
+from older detection rules. Start with known positive and negative pages and
+manually measure missed detections before trusting the review workload.
+
+The implementation is sequential, has no automatic retries within a run,
 and streams a source document into a fresh container for each conversion. This
 bounds working state but adds overhead for large PDFs. Add persistent conversion
-workers or resume only if the first batch demonstrates that need.
+workers only if the first batch demonstrates that need.
+
+## Read-only report viewer
+
+The same binary includes a web application; serving reports needs neither
+Docker nor Ollama. Put each collection's report under its directory:
+
+```text
+/srv/reports/
+  Rodale Series 2/report.jsonl
+  Other collection/report.json
+```
+
+```sh
+hawkeye serve /srv/reports --listen 127.0.0.1:8080
+```
+
+For colleagues, run it on a shared server behind your institutional login/TLS
+reverse proxy. Use `--listen :8080` if the proxy connects across a container
+network. The application has no built-in login. Run it as a user with read
+access to the report directories, or mount that directory read-only in the
+server environment. Scanning can run separately and append reports while the
+viewer is open; report files are never changed by the web application.
+
+The index discovers files ending in `jsonl` and `.json` files with `report` in
+their name, recursively, and links them by directory. Contents must be Hawkeye
+JSONL, even when the extension is `.json`. Report symlinks are ignored.
+Each report shows completed files, scanned pages, review candidates, and
+processing errors, using the latest attempt for each page. Counts reflect
+saved records, not an overall percentage: the report does not list inputs
+that have not yet produced a record. A timestamp shows the last saved update;
+an old timestamp cannot establish whether a scanner is still running.
+
+The default table shows pages needing attention. Switch to **All saved pages**
+to include negative results. **Copy table for Sheets** copies an HTML table and
+tab-separated text; ordinary browser selection/copy also works. Auto-refresh
+runs every ten seconds, pauses during text selection, and can be disabled.
+Copying the table disables refresh until reenabled. OCR transcripts and source
+documents are not served. The application accepts only read requests.
 
 ## Development checks
 
@@ -246,6 +320,8 @@ The Docker integration check uses synthetic two-page PDF and TIFF documents and
 a local mock Ollama server. It checks distinct page rendering, HTR API requests,
 failure reporting, report permissions, and suppression of sensitive error bodies.
 It does not measure model accuracy or validate the live Lehigh services.
+An opt-in [live model check](testdata/README.md) sends two synthetic printed pages
+through the actual OCR and assessment clients. It is excluded from normal CI.
 
 ## CI and releases
 

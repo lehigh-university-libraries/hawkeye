@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -129,6 +130,10 @@ func TestDiscovery(t *testing.T) {
 func TestDetection(t *testing.T) {
 	for _, tc := range []struct{ text, kind string }{
 		{"Account number:\n12345678", "bank_account"},
+		{"Acct # 12345678", "bank_account"},
+		{"Account 1234", "bank_account"},
+		{"An account in Merchants Bank was opened on\nDeposits to this account have totaled\nThe current balance in the account as of July 31, 1990 is", ""},
+		{"Account opened in 1990", ""},
 		{"⑆021000021⑆ 123456789⑈", "bank_number_candidate"},
 		{"Routing: 021000021", "routing_number"},
 		{"SSN 123-45-6789", "ssn"},
@@ -155,30 +160,19 @@ func TestDetection(t *testing.T) {
 	}
 }
 
-func combinedResponse(t *testing.T, text, analysis string) string {
-	t.Helper()
-	if analysis == "" {
-		analysis = `{"contains_sensitive":false,"readable":true,"sensitive_likelihood_percent":0,"kinds":[]}`
-	}
-	data, err := json.Marshal(map[string]any{"text": text, "assessment": json.RawMessage(analysis)})
-	if err != nil {
+const negativeAssessment = `{"contains_sensitive":false,"readable":true,"sensitive_likelihood_percent":0,"kinds":[]}`
+
+func TestAssessment(t *testing.T) {
+	valid := `{"contains_sensitive":true,"readable":true,"sensitive_likelihood_percent":85,"kinds":["bank_account"]}`
+	if _, err := parseAssessment(valid); err != nil {
 		t.Fatal(err)
 	}
-	return string(data)
-}
-
-func TestPageResponse(t *testing.T) {
-	valid := combinedResponse(t, "Account number: 12345678", `{"contains_sensitive":true,"readable":true,"sensitive_likelihood_percent":85,"kinds":["bank_account"]}`)
-	p, err := parsePageResponse(valid)
-	if err != nil || p.Text == nil || *p.Text != "Account number: 12345678" {
-		t.Fatalf("invalid transcription: %+v %v", p, err)
-	}
-	for _, raw := range []string{`{}`, `null`, "not JSON", `{"text":null}`, `{"text":123}`, strings.Replace(valid, "85", "101", 1), strings.Replace(valid, "true", "false", 1), strings.Replace(valid, "bank_account", "123456789", 1), strings.Replace(valid, `"text":`, `"missing_text":`, 1)} {
-		if _, err := parsePageResponse(raw); err == nil {
+	for _, raw := range []string{`{}`, `null`, "not JSON", `{"text":"A garden."}`, strings.Replace(valid, "85", "101", 1), strings.Replace(valid, "true", "false", 1), strings.Replace(valid, "bank_account", "123456789", 1), strings.Replace(valid, `["bank_account"]`, `[]`, 1)} {
+		if _, err := parseAssessment(raw); err == nil {
 			t.Errorf("accepted %q", raw)
 		}
 	}
-	if _, err := parsePageResponse("json\n" + valid); err != nil {
+	if _, err := parseAssessment("json\n" + valid); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -258,7 +252,7 @@ func TestDockerPipeline(t *testing.T) {
 	if err := os.WriteFile(pdf, syntheticPDF(), 0600); err != nil {
 		t.Fatal(err)
 	}
-	o := options{depth: -1, dpi: 100, maxEdge: 1200, timeout: time.Minute, image: envDefault("HAWKEYE_TEST_IMAGE", defaultImage), model: "glm-ocr:bf16", output: filepath.Join(dir, "report.jsonl")}
+	o := options{depth: -1, dpi: 100, maxEdge: 1200, timeout: time.Minute, image: envDefault("HAWKEYE_TEST_IMAGE", defaultImage), model: "glm-ocr:bf16", analysisModel: "qwen3.5:latest", output: filepath.Join(dir, "report.jsonl")}
 	count, err := pageCount(context.Background(), pdf, o)
 	if err != nil || count != 2 {
 		t.Fatalf("page count %d: %v", count, err)
@@ -299,6 +293,7 @@ func TestDockerPipeline(t *testing.T) {
 		t.Fatal("rendered first TIFF frame twice")
 	}
 	calls := 0
+	var retrySuccess atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/show" {
 			_, _ = io.WriteString(w, `{"capabilities":["completion","vision"]}`)
@@ -312,13 +307,24 @@ func TestDockerPipeline(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Error(err)
 		}
-		if r.URL.Path != "/api/generate" || request.Model != o.model || request.Prompt != pagePrompt || len(request.Images) != 1 || request.Stream {
+		if r.URL.Path != "/api/generate" || (request.Model != o.model && request.Model != o.analysisModel) || len(request.Images) != 1 || request.Stream {
 			t.Error("incorrect HTR request")
 		}
 		calls++
-		if calls == 1 {
-			_ = json.NewEncoder(w).Encode(map[string]any{"response": combinedResponse(t, "Account number: 12345678", ""), "done": true})
-		} else {
+		if retrySuccess.Load() {
+			response := negativeAssessment
+			if request.Model == o.model {
+				response = "A garden."
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"response": response})
+			return
+		}
+		switch calls {
+		case 1:
+			_ = json.NewEncoder(w).Encode(map[string]any{"response": "Account number: 12345678", "done": true})
+		case 2:
+			_ = json.NewEncoder(w).Encode(map[string]any{"response": negativeAssessment})
+		default:
 			http.Error(w, "secret document text", 500)
 		}
 	}))
@@ -330,7 +336,7 @@ func TestDockerPipeline(t *testing.T) {
 	if err := run(context.Background(), pdf, o, &stdout, &stderr); err == nil {
 		t.Fatal("failed page must cause nonzero exit")
 	}
-	for _, want := range []string{"Document 1/1", "Counting pages in Docker", "Page 1/2", "Rendering page in Docker", "OCR and assessment (glm-ocr:bf16)", "Page 1/2: review", "Page 2/2: error", "level=DEBUG", "Scan configuration", "image_bytes=", "Ollama HTTP 500"} {
+	for _, want := range []string{"Document 1/1", "Counting pages in Docker", "Page 1/2", "Rendering page in Docker", "OCR (glm-ocr:bf16)", "Assessment (qwen3.5:latest)", "Page 1/2: review", "Page 2/2: error", "level=DEBUG", "Scan configuration", "image_bytes=", "Ollama HTTP 500"} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Errorf("missing progress/debug message %q in %s", want, stderr.String())
 		}
@@ -365,7 +371,24 @@ func TestDockerPipeline(t *testing.T) {
 		t.Fatal("report permissions")
 	}
 	if err := run(context.Background(), pdf, o, &stdout, &stderr); err == nil {
-		t.Fatal("overwrote report")
+		t.Fatal("retry failure must still be reported")
+	}
+	if calls != 4 || !strings.Contains(stderr.String(), "skipping completed page") {
+		t.Fatal("resume repeated a successful page")
+	}
+	retrySuccess.Store(true)
+	if err := run(context.Background(), pdf, o, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 6 {
+		t.Fatalf("expected only failed page to receive OCR and assessment: %d calls", calls)
+	}
+	resumed, err := os.ReadFile(o.output)
+	if err != nil || !bytes.HasPrefix(resumed, report) {
+		t.Fatal("resume overwrote historical records")
+	}
+	if err := run(context.Background(), pdf, o, &stdout, &stderr); err != nil || calls != 6 {
+		t.Fatalf("completed file was not skipped: %v", err)
 	}
 	t.Run("interrupted report", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -377,18 +400,23 @@ func TestDockerPipeline(t *testing.T) {
 				return
 			}
 			calls++
-			if calls == 1 {
-				_ = json.NewEncoder(w).Encode(map[string]any{"response": combinedResponse(t, "Account number: 12345678", ""), "done": true})
+			if calls == 1 || calls == 3 {
+				_ = json.NewEncoder(w).Encode(map[string]any{"response": "Account number: 12345678", "done": true})
 				return
 			}
-			// Same context cancellation used by main's Ctrl+C handler, while OCR
-			// on the second page is still in flight.
+			if calls == 2 {
+				_ = json.NewEncoder(w).Encode(map[string]any{"response": negativeAssessment})
+				return
+			}
+			// Same context cancellation used by main's Ctrl+C handler, while assessment
+			// on the second page is still in flight, after OCR has completed.
 			cancel()
 		}))
 		defer server.Close()
 		options := o
 		options.endpoint = server.URL
 		options.output = filepath.Join(dir, "interrupted.jsonl")
+		options.includeText = true
 		if err := run(ctx, pdf, options, &stdout, &stderr); !errors.Is(err, context.Canceled) {
 			t.Fatalf("expected cancellation, got %v", err)
 		}
@@ -404,7 +432,7 @@ func TestDockerPipeline(t *testing.T) {
 		if err := dec.Decode(&interrupted); err != nil {
 			t.Fatal(err)
 		}
-		if first.Page != 1 || first.Status != "review" || interrupted.Page != 2 || interrupted.Status != "error" {
+		if first.Page != 1 || first.Status != "review" || interrupted.Page != 2 || interrupted.Status != "error" || interrupted.Text != "Account number: 12345678" {
 			t.Fatalf("lost completed page or interruption record: %+v %+v", first, interrupted)
 		}
 	})
@@ -515,33 +543,61 @@ func TestPageAssessmentAndFailures(t *testing.T) {
 		{"invalid assessment preserves OCR", "Account number: 12345678", `{}`, "error", true, false},
 		{"wrong assessment type preserves OCR", "Account number: 12345678", `"invalid"`, "error", true, false},
 		{"model only", "Account number: 12345678", "", "no_findings", true, true},
+		{"assessment HTTP failure preserves OCR", "Account number: 12345678", "HTTP500", "error", true, false},
+		{"assessment cancellation preserves OCR", "Account number: 12345678", "cancel", "error", true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls atomic.Int32
-			response := combinedResponse(t, tc.text, tc.assessment)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			response := tc.assessment
+			if response == "" {
+				response = negativeAssessment
+			}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/image" {
 					_, _ = w.Write(imageData)
 					return
 				}
-				calls.Add(1)
+				call := calls.Add(1)
 				var request struct {
 					Model, Prompt string
 					Images        []string
+					Format        json.RawMessage
+					Think         *bool
 				}
 				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 					t.Error(err)
 				}
-				if r.URL.Path != "/api/generate" || request.Model != "test-vision" || request.Prompt != pagePrompt || len(request.Images) != 1 {
-					t.Error("incorrect combined request")
+				if r.URL.Path != "/api/generate" || len(request.Images) != 1 {
+					t.Error("missing page image")
+				}
+				if call == 1 {
+					if request.Model != "test-ocr" || request.Prompt != ocrPrompt || len(request.Format) != 0 || request.Think != nil {
+						t.Error("OCR must use its plain transcription prompt without a JSON schema")
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"response": tc.text})
+					return
+				}
+				quoted, _ := json.Marshal(tc.text)
+				if request.Model != "test-analysis" || request.Prompt != analysisPrompt+string(quoted) || len(request.Format) == 0 || request.Think == nil || *request.Think {
+					t.Error("assessment must receive the image, quoted OCR, and assessment schema")
+				}
+				if response == "HTTP500" {
+					http.Error(w, "secret document text", http.StatusInternalServerError)
+					return
+				}
+				if response == "cancel" {
+					cancel()
+					return
 				}
 				_ = json.NewEncoder(w).Encode(map[string]any{"response": response, "done": true})
 			}))
 			defer server.Close()
 			t.Setenv("OLLAMA_URL", server.URL)
-			got := scanPage(context.Background(), input, 1, 1, options{model: "test-vision", houdiniURL: server.URL + "/image", timeout: time.Second, includeText: tc.includeText, noRegex: tc.noRegex})
-			if calls.Load() != 1 {
-				t.Fatalf("expected exactly one inference, got %d", calls.Load())
+			got := scanPage(ctx, input, 1, 1, options{model: "test-ocr", analysisModel: "test-analysis", houdiniURL: server.URL + "/image", timeout: time.Second, includeText: tc.includeText, noRegex: tc.noRegex})
+			if calls.Load() != 2 {
+				t.Fatalf("expected separate OCR and assessment calls, got %d", calls.Load())
 			}
 			if got.Status != tc.status {
 				t.Fatalf("got %+v", got)
@@ -555,10 +611,86 @@ func TestPageAssessmentAndFailures(t *testing.T) {
 			if got.Status != "error" && got.Assessment == nil {
 				t.Fatal("missing model assessment")
 			}
-			if tc.name == "invalid assessment preserves OCR" && len(got.Findings) == 0 {
+			if strings.Contains(got.Error, "secret document text") {
+				t.Fatal("assessment error leaked response content")
+			}
+			if strings.Contains(tc.name, "preserves OCR") && len(got.Findings) == 0 {
 				t.Fatal("lost rule findings from retained transcription")
 			}
 		})
+	}
+}
+
+func TestContextWindow(t *testing.T) {
+	imageData := testPNG(t)
+	input := filepath.Join(t.TempDir(), "page.png")
+	if err := os.WriteFile(input, imageData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		args []string
+		want int
+	}{
+		{"default", nil, 16384},
+		{"override", []string{"--num-ctx", "32768"}, 32768},
+		{"server default", []string{"--num-ctx", "0"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := newCommand()
+			if err := cmd.ParseFlags(tc.args); err != nil {
+				t.Fatal(err)
+			}
+			numCtx, err := cmd.Flags().GetInt("num-ctx")
+			if err != nil || numCtx != tc.want {
+				t.Fatalf("num-ctx = %d, err = %v", numCtx, err)
+			}
+			var calls atomic.Int32
+			response := negativeAssessment
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/image" {
+					_, _ = w.Write(imageData)
+					return
+				}
+				call := calls.Add(1)
+				var request struct {
+					Options map[string]int `json:"options"`
+					Format  struct {
+						Required []string
+					}
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+				}
+				got, present := request.Options["num_ctx"]
+				if call == 1 && request.Format.Required != nil {
+					t.Error("OCR must not be forced into the assessment schema")
+				}
+				if call == 2 && !slices.Equal(request.Format.Required, []string{"contains_sensitive", "readable", "sensitive_likelihood_percent", "kinds"}) {
+					t.Error("assessment schema must require every field")
+				}
+				if got != tc.want || present != (tc.want > 0) {
+					t.Errorf("num_ctx = %d, present = %v; want %d", got, present, tc.want)
+				}
+				if call == 1 {
+					_ = json.NewEncoder(w).Encode(map[string]any{"response": "A garden."})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"response": response})
+			}))
+			defer server.Close()
+			t.Setenv("OLLAMA_URL", server.URL)
+			got := scanPage(context.Background(), input, 1, 1, options{model: "test-ocr", analysisModel: "test-analysis", numCtx: numCtx, houdiniURL: server.URL + "/image", timeout: time.Second})
+			if got.Status != "no_findings" || calls.Load() != 2 {
+				t.Fatalf("result = %+v, requests = %d", got, calls.Load())
+			}
+		})
+	}
+
+	cmd := newCommand()
+	cmd.SetArgs([]string{"--num-ctx", "-1"})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "num-ctx must be nonnegative") {
+		t.Fatalf("negative num-ctx was not rejected: %v", err)
 	}
 }
 
@@ -603,27 +735,44 @@ func TestVisionModelValidation(t *testing.T) {
 }
 
 func TestTextOnlyModelStopsBeforeScanning(t *testing.T) {
-	dir := t.TempDir()
-	input := filepath.Join(dir, "page.png")
-	if err := os.WriteFile(input, testPNG(t), 0600); err != nil {
-		t.Fatal(err)
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/show" {
-			t.Error("document submitted before validation")
-			http.Error(w, "unexpected request", 500)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"capabilities": []string{"completion"}})
-	}))
-	defer server.Close()
-	t.Setenv("OLLAMA_URL", server.URL)
-	o := options{endpoint: server.URL, model: "gpt-oss:latest", image: defaultImage, dpi: 200, timeout: time.Second, output: filepath.Join(dir, "report.jsonl")}
-	err := run(context.Background(), input, o, io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "does not support images") {
-		t.Fatalf("unsupported model was not rejected: %v", err)
-	}
-	if _, err := os.Stat(o.output); !os.IsNotExist(err) {
-		t.Fatalf("report created before model validation: %v", err)
+	for _, stage := range []string{"OCR", "assessment"} {
+		t.Run(stage, func(t *testing.T) {
+			dir := t.TempDir()
+			input := filepath.Join(dir, "page.png")
+			if err := os.WriteFile(input, testPNG(t), 0600); err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/show" {
+					t.Error("document submitted before validation")
+					http.Error(w, "unexpected request", 500)
+					return
+				}
+				var request struct{ Model string }
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+				}
+				capabilities := []string{"completion", "vision"}
+				if request.Model == "text-only" {
+					capabilities = []string{"completion"}
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"capabilities": capabilities})
+			}))
+			defer server.Close()
+			t.Setenv("OLLAMA_URL", server.URL)
+			o := options{endpoint: server.URL, model: "vision", analysisModel: "vision", image: defaultImage, dpi: 200, timeout: time.Second, output: filepath.Join(dir, "report.jsonl")}
+			if stage == "OCR" {
+				o.model = "text-only"
+			} else {
+				o.analysisModel = "text-only"
+			}
+			err := run(context.Background(), input, o, io.Discard, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), "does not support images") {
+				t.Fatalf("unsupported model was not rejected: %v", err)
+			}
+			if _, err := os.Stat(o.output); !os.IsNotExist(err) {
+				t.Fatalf("report created before model validation: %v", err)
+			}
+		})
 	}
 }

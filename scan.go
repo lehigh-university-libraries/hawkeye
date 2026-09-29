@@ -27,12 +27,12 @@ import (
 const defaultImage = "islandora/houdini@sha256:22f87ca3232b7edccfb0b0c4d769c77f9a97e29c1968a75a4481ed3b6369682a"
 
 type options struct {
-	depth, dpi, maxEdge                        int
-	endpoint, model, image, houdiniURL, output string
-	timeout                                    time.Duration
-	includeText, noRegex                       bool
-	progress                                   io.Writer
-	logger                                     *slog.Logger
+	depth, dpi, maxEdge, numCtx                               int
+	endpoint, model, analysisModel, image, houdiniURL, output string
+	timeout                                                   time.Duration
+	includeText, noRegex                                      bool
+	progress                                                  io.Writer
+	logger                                                    *slog.Logger
 }
 
 func (o options) debug(message string, args ...any) {
@@ -120,6 +120,7 @@ func reportProgress(w io.Writer, label string, interval time.Duration) func() {
 type result struct {
 	File          string      `json:"file"`
 	Page          int         `json:"page"`
+	PageCount     int         `json:"page_count,omitempty"`
 	Status        string      `json:"status"`
 	OCRModel      string      `json:"ocr_model"`
 	AnalysisModel string      `json:"analysis_model,omitempty"`
@@ -146,15 +147,18 @@ func newCommand() *cobra.Command {
 	f := cmd.Flags()
 	f.IntVarP(&o.depth, "depth", "d", -1, "Subdirectory levels to scan; 0 = this directory, -1 = unlimited")
 	f.StringVar(&o.endpoint, "ollama-url", envDefault("OLLAMA_URL", "https://ollama.cc.lehigh.edu"), "On-prem Ollama URL")
-	f.StringVar(&o.model, "model", "glm-ocr:bf16", "Vision model for combined OCR and PII assessment")
+	f.StringVar(&o.model, "model", "glm-ocr:bf16", "Vision model for plain OCR transcription")
+	f.StringVar(&o.analysisModel, "analysis-model", "qwen3.5:latest", "Vision model to assess the page image and OCR transcription")
+	f.IntVar(&o.numCtx, "num-ctx", 16384, "Ollama context window in tokens; 0 uses the server/model default")
 	f.StringVar(&o.houdiniURL, "houdini-url", "", "Optional on-prem Houdini image optimization endpoint (raw POST)")
 	f.StringVar(&o.image, "docker-image", defaultImage, "Houdini image containing ImageMagick and Ghostscript")
 	f.IntVar(&o.dpi, "dpi", 200, "PDF render DPI")
 	f.IntVar(&o.maxEdge, "max-edge", 2400, "Maximum image edge in pixels; 0 preserves rendered size")
 	f.DurationVar(&o.timeout, "timeout", 5*time.Minute, "Timeout for each conversion or API request")
-	f.StringVarP(&o.output, "output", "o", "hawkeye-report.jsonl", "New JSONL report path, or - for stdout")
+	f.StringVarP(&o.output, "output", "o", "hawkeye-report.jsonl", "JSONL report to create or resume, or - for stdout")
 	f.BoolVar(&o.includeText, "include-text", true, "Retain OCR text in report; use --include-text=false to omit it")
 	f.BoolVar(&o.noRegex, "no-regex", false, "Disable text rules; retain model assessment")
+	cmd.AddCommand(newServeCommand())
 	return cmd
 }
 
@@ -263,8 +267,11 @@ func run(ctx context.Context, path string, o options, stdout, stderr io.Writer) 
 	if err != nil {
 		return err
 	}
-	if o.depth < -1 || o.dpi < 1 || o.maxEdge < 0 || o.timeout <= 0 || strings.TrimSpace(o.model) == "" || o.image == "" {
-		return errors.New("invalid depth, DPI, maximum edge, timeout, model, or Docker image")
+	if o.depth < -1 || o.dpi < 1 || o.maxEdge < 0 || o.timeout <= 0 || strings.TrimSpace(o.model) == "" || strings.TrimSpace(o.analysisModel) == "" || o.image == "" {
+		return errors.New("invalid depth, DPI, maximum edge, timeout, OCR/analysis model, or Docker image")
+	}
+	if o.numCtx < 0 {
+		return errors.New("num-ctx must be nonnegative; 0 uses the server/model default")
 	}
 	if err := validateURL(o.endpoint); err != nil {
 		return err
@@ -281,29 +288,56 @@ func run(ctx context.Context, path string, o options, stdout, stderr io.Writer) 
 	if len(files) == 0 {
 		return errors.New("no supported PDFs or images found")
 	}
+	checkpoint := &reportCheckpoint{}
+	if o.output != "-" {
+		checkpoint, err = loadReport(o.output)
+		if err != nil {
+			return fmt.Errorf("load report: %w", err)
+		}
+		defer func() {
+			if checkpoint.file != nil {
+				_ = checkpoint.file.Close()
+			}
+		}()
+	}
+	remaining := 0
+	for _, file := range files {
+		if !checkpoint.fileDone(file) {
+			remaining++
+		}
+	}
 	if err := os.Setenv("OLLAMA_URL", strings.TrimRight(o.endpoint, "/")); err != nil {
 		return err
 	}
-	o.debug("Scan configuration", "ollama_url", o.endpoint, "model", o.model, "houdini_url", o.houdiniURL, "docker_image", o.image, "dpi", o.dpi, "max_edge", o.maxEdge, "timeout", o.timeout, "documents", len(files))
-	stop := o.startProgress(fmt.Sprintf("Checking image support (%s)", o.model))
-	err = validateVisionModel(ctx, o, o.model)
-	stop()
-	if err != nil {
-		return err
+	o.debug("Scan configuration", "ollama_url", o.endpoint, "model", o.model, "analysis_model", o.analysisModel, "num_ctx", o.numCtx, "houdini_url", o.houdiniURL, "docker_image", o.image, "dpi", o.dpi, "max_edge", o.maxEdge, "timeout", o.timeout, "documents", len(files))
+	models := []string{o.model, o.analysisModel}
+	if remaining == 0 {
+		models = nil
 	}
-	o.debug("Model supports images", "model", o.model)
+	for _, model := range models {
+		stop := o.startProgress(fmt.Sprintf("Checking image support (%s)", model))
+		err = validateVisionModel(ctx, o, model)
+		stop()
+		if err != nil {
+			return err
+		}
+		o.debug("Model supports images", "model", model)
+	}
 	writer := stdout
 	var report *os.File
 	if o.output != "-" {
-		report, err = os.OpenFile(o.output, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-		if err != nil {
-			return fmt.Errorf("create report (existing files are never overwritten): %w", err)
+		if err := checkpoint.prepareAppend(o.output); err != nil {
+			return fmt.Errorf("prepare report: %w", err)
 		}
-		defer report.Close()
+		if checkpoint.partial {
+			fmt.Fprintln(stderr, "Recovered report: discarded an incomplete final JSONL record")
+		}
+		report = checkpoint.file
 		writer = report
 	}
 	enc := json.NewEncoder(writer)
 	failed, reviewed, pages := 0, 0, 0
+	skippedFiles, skippedPages := 0, 0
 	write := func(r result) error {
 		if err := saveResult(enc, report, r); err != nil {
 			return err
@@ -324,6 +358,11 @@ func run(ctx context.Context, path string, o options, stdout, stderr io.Writer) 
 			return err
 		}
 		fmt.Fprintf(stderr, "Document %d/%d: %q\n", i+1, len(files), filepath.Base(file))
+		if checkpoint.fileDone(file) {
+			fmt.Fprintln(stderr, "    Skipping: already completed in report")
+			skippedFiles++
+			continue
+		}
 		count, err := pageCount(ctx, file, o)
 		if err != nil {
 			fmt.Fprintf(stderr, "  Error counting pages: %v\n", err)
@@ -335,6 +374,11 @@ func run(ctx context.Context, path string, o options, stdout, stderr io.Writer) 
 		for page := 1; page <= count; page++ {
 			if err := ctx.Err(); err != nil {
 				return err
+			}
+			if checkpoint.pageDone(file, page) {
+				fmt.Fprintf(stderr, "  Page %d/%d: skipping completed page\n", page, count)
+				skippedPages++
+				continue
 			}
 			fmt.Fprintf(stderr, "  Page %d/%d\n", page, count)
 			pageStarted := time.Now()
@@ -349,6 +393,9 @@ func run(ctx context.Context, path string, o options, stdout, stderr io.Writer) 
 		}
 	}
 	fmt.Fprintf(stderr, "%d pages; %d flagged for review; %d processing errors; %s elapsed\n", pages, reviewed, failed, time.Since(started).Round(time.Second))
+	if skippedFiles > 0 || skippedPages > 0 {
+		fmt.Fprintf(stderr, "Resumed report: skipped %d completed files and %d completed pages in remaining files\n", skippedFiles, skippedPages)
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -373,7 +420,7 @@ func saveResult(enc *json.Encoder, report *os.File, r result) error {
 }
 
 func scanPage(ctx context.Context, file string, page, count int, o options) result {
-	r := result{File: file, Page: page, Status: "error", OCRModel: o.model, AnalysisModel: o.model, Findings: []finding{}}
+	r := result{File: file, Page: page, PageCount: count, Status: "error", OCRModel: o.model, AnalysisModel: o.analysisModel, Findings: []finding{}}
 	data, err := prepareImage(ctx, file, page, count, o)
 	if err != nil {
 		// Preparation errors omit HTTP bodies and conversion stderr; keep their
@@ -383,46 +430,61 @@ func scanPage(ctx context.Context, file string, page, count int, o options) resu
 		return r
 	}
 	o.debug("Image prepared", "page", page, "image_bytes", len(data))
-	provider := ollama.New()
-	config := providers.Config{Model: o.model, Prompt: pagePrompt, Temperature: 0, Timeout: o.timeout}
 	encoded := base64.StdEncoding.EncodeToString(data)
-	stop := o.startProgress(fmt.Sprintf("OCR and assessment (%s)", o.model))
-	requested := time.Now()
-	raw, usage, err := provider.ExtractText(ctx, config, file, encoded)
-	stop()
-	// HTR errors can include response bodies containing PII. Never persist them.
+	text, err := o.extract(ctx, file, encoded, "OCR", o.model, ocrPrompt, nil)
 	if err != nil {
-		r.Error = fmt.Sprintf("OCR and assessment request failed: %s; page requires review", ollamaFailure(err))
-		o.debug("Model request failed", "page", page, "model", config.Model, "elapsed", time.Since(requested), "error", r.Error)
+		r.Error = fmt.Sprintf("OCR request failed: %s; page requires review", ollamaFailure(err))
 		return r
 	}
-	p, err := parsePageResponse(raw)
-	// Keep a valid transcription and its rule findings even if the assessment
-	// fails validation. Never treat the unparsed JSON response as OCR text.
-	if p.Text != nil {
-		if o.includeText {
-			r.Text = *p.Text
-		}
-		if !o.noRegex {
-			r.Findings = detect(*p.Text)
-		}
-		if strings.TrimSpace(*p.Text) == "" {
-			r.Findings = append(r.Findings, finding{Kind: "empty_ocr", Source: "ocr"})
-		}
+	// Save OCR and run independent rules before analysis, including on analysis
+	// failure or cancellation. The analysis model never rewrites the transcript.
+	if o.includeText {
+		r.Text = text
 	}
+	if !o.noRegex {
+		r.Findings = detect(text)
+	}
+	if strings.TrimSpace(text) == "" {
+		r.Findings = append(r.Findings, finding{Kind: "empty_ocr", Source: "ocr"})
+	}
+	quoted, _ := json.Marshal(text) // A string is always JSON-encodable.
+	raw, err := o.extract(ctx, file, encoded, "Assessment", o.analysisModel, analysisPrompt+string(quoted), json.RawMessage(assessmentSchema))
 	if err != nil {
-		r.Error = fmt.Sprintf("invalid OCR and assessment response: %v; use a vision model that supports the combined JSON prompt; page requires review", err)
-		o.debug("Model response validation failed", "page", page, "error", err.Error())
+		r.Error = fmt.Sprintf("assessment request failed: %s; page requires review", ollamaFailure(err))
 		return r
 	}
-	r.Assessment = p.Assessment
+	r.Assessment, err = parseAssessment(raw)
+	if err != nil {
+		r.Error = fmt.Sprintf("invalid assessment response: %v; page requires review", err)
+		o.debug("Model response validation failed", "page", page, "model", o.analysisModel, "error", err.Error())
+		return r
+	}
 	for _, kind := range r.Assessment.Kinds {
 		r.Findings = append(r.Findings, finding{Kind: kind, Source: "model"})
 	}
-	o.debug("OCR and assessment completed", "page", page, "model", config.Model, "elapsed", time.Since(requested), "text_bytes", len(*p.Text), "input_tokens", usage.InputTokens, "output_tokens", usage.OutputTokens)
 	r.Status = "no_findings"
 	if len(r.Findings) > 0 || *r.Assessment.ContainsSensitive || !*r.Assessment.Readable {
 		r.Status = "review"
 	}
 	return r
+}
+
+func (o options) extract(ctx context.Context, file, encoded, stage, model, prompt string, format json.RawMessage) (string, error) {
+	stop := o.startProgress(fmt.Sprintf("%s (%s)", stage, model))
+	defer stop()
+	requested := time.Now()
+	config := providers.Config{Model: model, Prompt: prompt, Temperature: 0, Timeout: o.timeout, NumCtx: o.numCtx, Format: format}
+	if len(format) > 0 {
+		// Qwen's thinking mode can consume the structured output without a final
+		// response. Request only the assessment; never parse a reasoning trace.
+		config.Think = new(bool)
+	}
+	text, usage, err := ollama.New().ExtractText(ctx, config, file, encoded)
+	// HTR errors may contain document data; log only the sanitized description.
+	if err != nil {
+		o.debug("Model request failed", "stage", stage, "model", model, "elapsed", time.Since(requested), "error", ollamaFailure(err))
+	} else {
+		o.debug("Model request completed", "stage", stage, "model", model, "elapsed", time.Since(requested), "response_bytes", len(text), "input_tokens", usage.InputTokens, "output_tokens", usage.OutputTokens)
+	}
+	return text, err
 }
