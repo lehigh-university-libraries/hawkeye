@@ -393,6 +393,59 @@ func TestDockerPipeline(t *testing.T) {
 	if err := run(context.Background(), pdf, o, &stdout, &stderr); err != nil || calls != 6 {
 		t.Fatalf("completed file was not skipped: %v", err)
 	}
+	t.Run("request limit and resume", func(t *testing.T) {
+		images := t.TempDir()
+		for _, name := range []string{"a.png", "b.png"} {
+			if err := os.WriteFile(filepath.Join(images, name), first, 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, path := range []string{pdf, images} {
+			for _, limit := range []int{2, 3} {
+				limited := o
+				limited.limit = limit
+				limited.output = filepath.Join(t.TempDir(), "report.jsonl")
+				startCalls := calls
+				for iteration, wantCalls := range []int{2, 4, 4} {
+					stderr.Reset()
+					if err := run(context.Background(), path, limited, &stdout, &stderr); err != nil {
+						t.Fatal(err)
+					}
+					if calls-startCalls != wantCalls {
+						t.Fatalf("limit %d run %d: got %d calls, want %d", limit, iteration, calls-startCalls, wantCalls)
+					}
+					if strings.Contains(stderr.String(), "Request limit reached") != (iteration == 0) {
+						t.Fatalf("incorrect stop message: %s", stderr.String())
+					}
+					data, err := os.ReadFile(limited.output)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var records []result
+					if _, err := readReport(bytes.NewReader(data), func(r result) { records = append(records, r) }); err != nil {
+						t.Fatal(err)
+					}
+					if len(records) != wantCalls/2 {
+						t.Fatalf("lost or repeated page records: %+v", records)
+					}
+					for _, r := range records {
+						if r.Status != "no_findings" || r.Assessment == nil {
+							t.Fatalf("limit interrupted a page: %+v", r)
+						}
+					}
+				}
+			}
+		}
+		limited := o
+		limited.limit = 2
+		limited.output = filepath.Join(t.TempDir(), "report.jsonl")
+		retrySuccess.Store(false)
+		defer retrySuccess.Store(true)
+		startCalls := calls
+		if err := run(context.Background(), pdf, limited, &stdout, &stderr); err == nil || calls-startCalls != 1 {
+			t.Fatalf("failed OCR must count, leaving too little allowance for another page: err=%v calls=%d", err, calls-startCalls)
+		}
+	})
 	t.Run("interrupted report", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -635,6 +688,21 @@ func TestPageAssessmentAndFailures(t *testing.T) {
 				t.Fatal("lost rule findings from retained transcription")
 			}
 		})
+	}
+}
+
+func TestRequestLimitFlag(t *testing.T) {
+	cmd := newCommand()
+	limit, err := cmd.Flags().GetInt("limit")
+	if err != nil || limit != 0 {
+		t.Fatalf("default limit = %d, err = %v", limit, err)
+	}
+	for _, value := range []string{"-1", "1"} {
+		cmd := newCommand()
+		cmd.SetArgs([]string{"--limit", value})
+		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "limit must be") {
+			t.Fatalf("invalid limit %s accepted: %v", value, err)
+		}
 	}
 }
 

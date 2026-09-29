@@ -27,12 +27,13 @@ import (
 const defaultImage = "islandora/houdini@sha256:22f87ca3232b7edccfb0b0c4d769c77f9a97e29c1968a75a4481ed3b6369682a"
 
 type options struct {
-	depth, dpi, maxEdge, numCtx                               int
+	depth, dpi, maxEdge, numCtx, limit                        int
 	endpoint, model, analysisModel, image, houdiniURL, output string
 	timeout, requestDelay                                     time.Duration
 	includeText, noRegex                                      bool
 	progress                                                  io.Writer
 	logger                                                    *slog.Logger
+	requests                                                  *int
 }
 
 func (o options) debug(message string, args ...any) {
@@ -164,6 +165,7 @@ func newCommand() *cobra.Command {
 	f.IntVar(&o.maxEdge, "max-edge", 2400, "Maximum image edge in pixels; 0 preserves rendered size")
 	f.DurationVar(&o.timeout, "timeout", 5*time.Minute, "Timeout for each conversion or API request")
 	f.DurationVar(&o.requestDelay, "request-delay", 2*time.Second, "Pause before each Ollama inference request; 0 disables the pause")
+	f.IntVar(&o.limit, "limit", 0, "Maximum Ollama inference attempts per run; stop between pages (0 = unlimited, minimum 2)")
 	f.StringVarP(&o.output, "output", "o", "hawkeye-report.jsonl", "JSONL report to create or resume, or - for stdout")
 	f.BoolVar(&o.includeText, "include-text", true, "Retain OCR text in report; use --include-text=false to omit it")
 	f.BoolVar(&o.noRegex, "no-regex", false, "Disable text rules; retain model assessment")
@@ -285,6 +287,9 @@ func run(ctx context.Context, path string, o options, stdout, stderr io.Writer) 
 	if o.requestDelay < 0 {
 		return errors.New("request-delay must be nonnegative; 0 disables the pause")
 	}
+	if o.limit < 0 || o.limit == 1 {
+		return errors.New("limit must be 0 (unlimited) or at least 2 for OCR and assessment")
+	}
 	if err := validateURL(o.endpoint); err != nil {
 		return err
 	}
@@ -321,7 +326,7 @@ func run(ctx context.Context, path string, o options, stdout, stderr io.Writer) 
 	if err := os.Setenv("OLLAMA_URL", strings.TrimRight(o.endpoint, "/")); err != nil {
 		return err
 	}
-	o.debug("Scan configuration", "ollama_url", o.endpoint, "model", o.model, "analysis_model", o.analysisModel, "num_ctx", o.numCtx, "houdini_url", o.houdiniURL, "docker_image", o.image, "dpi", o.dpi, "max_edge", o.maxEdge, "timeout", o.timeout, "request_delay", o.requestDelay, "documents", len(files))
+	o.debug("Scan configuration", "ollama_url", o.endpoint, "model", o.model, "analysis_model", o.analysisModel, "num_ctx", o.numCtx, "houdini_url", o.houdiniURL, "docker_image", o.image, "dpi", o.dpi, "max_edge", o.maxEdge, "timeout", o.timeout, "request_delay", o.requestDelay, "limit", o.limit, "documents", len(files))
 	models := []string{o.model, o.analysisModel}
 	if remaining == 0 {
 		models = nil
@@ -350,6 +355,8 @@ func run(ctx context.Context, path string, o options, stdout, stderr io.Writer) 
 	enc := json.NewEncoder(writer)
 	failed, reviewed, pages := 0, 0, 0
 	skippedFiles, skippedPages := 0, 0
+	o.requests = new(int)
+	limitReached := false
 	write := func(r result) error {
 		if err := saveResult(enc, report, r); err != nil {
 			return err
@@ -365,6 +372,7 @@ func run(ctx context.Context, path string, o options, stdout, stderr io.Writer) 
 		}
 		return nil
 	}
+scan:
 	for i, file := range files {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -374,6 +382,10 @@ func run(ctx context.Context, path string, o options, stdout, stderr io.Writer) 
 			fmt.Fprintln(stderr, "    Skipping: already completed in report")
 			skippedFiles++
 			continue
+		}
+		if o.limit > 0 && o.limit-*o.requests < 2 {
+			limitReached = true
+			break
 		}
 		count, err := pageCount(ctx, file, o)
 		if err != nil {
@@ -392,6 +404,12 @@ func run(ctx context.Context, path string, o options, stdout, stderr io.Writer) 
 				skippedPages++
 				continue
 			}
+			// Reserve both calls before starting a page so resumption does not
+			// repeat OCR just because this run exhausted its request allowance.
+			if o.limit > 0 && o.limit-*o.requests < 2 {
+				limitReached = true
+				break scan
+			}
 			fmt.Fprintf(stderr, "  Page %d/%d\n", page, count)
 			pageStarted := time.Now()
 			r := scanPage(ctx, file, page, count, o)
@@ -407,6 +425,12 @@ func run(ctx context.Context, path string, o options, stdout, stderr io.Writer) 
 	fmt.Fprintf(stderr, "%d pages; %d flagged for review; %d processing errors; %s elapsed\n", pages, reviewed, failed, time.Since(started).Round(time.Second))
 	if skippedFiles > 0 || skippedPages > 0 {
 		fmt.Fprintf(stderr, "Resumed report: skipped %d completed files and %d completed pages in remaining files\n", skippedFiles, skippedPages)
+	}
+	if o.limit > 0 {
+		fmt.Fprintf(stderr, "Ollama inference attempts: %d/%d\n", *o.requests, o.limit)
+	}
+	if limitReached {
+		fmt.Fprintln(stderr, "Request limit reached: stopping before the next page; rerun with the same report to continue")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -508,6 +532,9 @@ func (o options) extract(ctx context.Context, encoded, stage, model, prompt stri
 	}
 	// Omit the source filename: HTR must detect the prepared image's MIME type
 	// from its bytes, not reject a rendered page because its source was a PDF.
+	if o.requests != nil {
+		*o.requests++
+	}
 	text, usage, err := ollama.New().ExtractText(ctx, config, "", encoded)
 	// HTR errors may contain document data; log only the sanitized description.
 	if err != nil {

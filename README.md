@@ -248,6 +248,22 @@ For an interrupted run, rerun the same command with the same output report:
 # After a crash or interruption, run that same command again.
 ```
 
+To process a bounded batch, keep the same report and request limit on each run:
+
+```sh
+./hawkeye /path/to/images --limit 500 -o /path/to/images/report.jsonl
+```
+
+`--limit` caps Ollama inference attempts in this invocation, including failed
+attempts. OCR and assessment each count as one, so 500 normally completes 250
+pages. Capability checks, Docker/Houdini operations, and skipped pages do not
+count. Hawkeye starts a page only when at least two requests remain, saves its
+result, and stops before exceeding the limit. An odd limit may leave one request
+unused. The default `0` is unlimited; positive limits must be at least `2`.
+Reaching the limit is a normal exit; processing errors still cause a nonzero
+exit. Rerun the command to skip completed pages and retry errors or scan the
+remaining pages. A report written to stdout (`-o -`) cannot be resumed.
+
 Resume keys are absolute file paths and one-based page numbers. The latest
 `review` or `no_findings` record completes a page; `error` records are retried.
 A review finding is a completed scan, not a processing failure. New files are
