@@ -31,6 +31,9 @@ type options struct {
 	endpoint, model, analysisModel, image, houdiniURL, output string
 	timeout, requestDelay                                     time.Duration
 	includeText, noRegex                                      bool
+	retryErrors                                               bool
+	retryDelays                                               []time.Duration
+	onRetry                                                   func(stage string, attempt int, delay time.Duration, err error) error
 	progress                                                  io.Writer
 	logger                                                    *slog.Logger
 	requests                                                  *int
@@ -127,16 +130,24 @@ func reportProgress(w io.Writer, label string, interval time.Duration) func() {
 }
 
 type result struct {
-	File          string      `json:"file"`
-	Page          int         `json:"page"`
-	PageCount     int         `json:"page_count,omitempty"`
-	Status        string      `json:"status"`
-	OCRModel      string      `json:"ocr_model"`
-	AnalysisModel string      `json:"analysis_model,omitempty"`
-	Text          string      `json:"text,omitempty"`
-	Findings      []finding   `json:"findings"`
-	Assessment    *assessment `json:"assessment,omitempty"`
-	Error         string      `json:"error,omitempty"`
+	File            string      `json:"file"`
+	Page            int         `json:"page"`
+	PageCount       int         `json:"page_count,omitempty"`
+	Status          string      `json:"status"`
+	OCRModel        string      `json:"ocr_model"`
+	AnalysisModel   string      `json:"analysis_model,omitempty"`
+	Text            string      `json:"text,omitempty"`
+	Findings        []finding   `json:"findings"`
+	Assessment      *assessment `json:"assessment,omitempty"`
+	Error           string      `json:"error,omitempty"`
+	RetryCount      int         `json:"retry_count,omitempty"`
+	DeadLetter      bool        `json:"dead_letter,omitempty"`
+	RequestRetries  int         `json:"request_retries,omitempty"`
+	RetryStage      string      `json:"retry_stage,omitempty"`
+	RetryAttempt    int         `json:"retry_attempt,omitempty"`
+	RetryAt         time.Time   `json:"retry_at,omitzero"`
+	DocumentStopped bool        `json:"document_stopped,omitempty"`
+	CircuitOpen     bool        `json:"circuit_open,omitempty"`
 }
 
 func newCommand() *cobra.Command {
@@ -169,6 +180,7 @@ func newCommand() *cobra.Command {
 	f.StringVarP(&o.output, "output", "o", "hawkeye-report.jsonl", "JSONL report to create or resume, or - for stdout")
 	f.BoolVar(&o.includeText, "include-text", true, "Retain OCR text in report; use --include-text=false to omit it")
 	f.BoolVar(&o.noRegex, "no-regex", false, "Disable text rules; retain model assessment")
+	f.BoolVar(&o.retryErrors, "retry-errors", false, "Retry recorded failures first (automatic when resuming an existing report)")
 	cmd.AddCommand(newServeCommand())
 	return cmd
 }
@@ -290,6 +302,9 @@ func run(ctx context.Context, path string, o options, stdout, stderr io.Writer) 
 	if o.limit < 0 || o.limit == 1 {
 		return errors.New("limit must be 0 (unlimited) or at least 2 for OCR and assessment")
 	}
+	if o.retryErrors && o.output == "-" {
+		return errors.New("retry-errors requires an existing output report, not stdout")
+	}
 	if err := validateURL(o.endpoint); err != nil {
 		return err
 	}
@@ -316,6 +331,9 @@ func run(ctx context.Context, path string, o options, stdout, stderr io.Writer) 
 				_ = checkpoint.file.Close()
 			}
 		}()
+	}
+	if o.retryErrors && checkpoint.file == nil {
+		return errors.New("retry-errors requires an existing output report")
 	}
 	remaining := 0
 	for _, file := range files {
@@ -354,6 +372,9 @@ func run(ctx context.Context, path string, o options, stdout, stderr io.Writer) 
 	}
 	enc := json.NewEncoder(writer)
 	failed, reviewed, pages := 0, 0, 0
+	failedDocuments := 0
+	circuitOpen := false
+	pageCounts := make(map[string]int)
 	skippedFiles, skippedPages := 0, 0
 	o.requests = new(int)
 	limitReached := false
@@ -373,52 +394,138 @@ func run(ctx context.Context, path string, o options, stdout, stderr io.Writer) 
 		return nil
 	}
 scan:
-	for i, file := range files {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		fmt.Fprintf(stderr, "Document %d/%d: %q\n", i+1, len(files), filepath.Base(file))
-		if checkpoint.fileDone(file) {
-			fmt.Fprintln(stderr, "    Skipping: already completed in report")
-			skippedFiles++
-			continue
-		}
-		if o.limit > 0 && o.limit-*o.requests < 2 {
-			limitReached = true
-			break
-		}
-		count, err := pageCount(ctx, file, o)
-		if err != nil {
-			fmt.Fprintf(stderr, "  Error counting pages: %v\n", err)
-			if err := write(result{File: file, Status: "error", OCRModel: o.model, Findings: []finding{}, Error: fmt.Sprintf("page enumeration failed: %v; document requires review", err)}); err != nil {
-				return err
+	for _, retrying := range []bool{true, false} {
+		if retrying {
+			if !slices.ContainsFunc(files, checkpoint.hasErrors) {
+				continue
 			}
-			continue
+			fmt.Fprintln(stderr, "Retrying recorded failures before new pages")
 		}
-		for page := 1; page <= count; page++ {
+		for i, file := range files {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if checkpoint.pageDone(file, page) {
-				fmt.Fprintf(stderr, "  Page %d/%d: skipping completed page\n", page, count)
-				skippedPages++
+			if retrying && !checkpoint.hasErrors(file) {
 				continue
 			}
-			// Reserve both calls before starting a page so resumption does not
-			// repeat OCR just because this run exhausted its request allowance.
+			fmt.Fprintf(stderr, "Document %d/%d: %q\n", i+1, len(files), filepath.Base(file))
+			if checkpoint.fileDone(file) {
+				fmt.Fprintln(stderr, "    Skipping: already completed or dead-lettered in report")
+				skippedFiles++
+				continue
+			}
+			// Enumeration failures are handled entirely in the retry pass.
+			if !retrying && checkpoint.pageFailed(file, 0) {
+				continue
+			}
 			if o.limit > 0 && o.limit-*o.requests < 2 {
 				limitReached = true
 				break scan
 			}
-			fmt.Fprintf(stderr, "  Page %d/%d\n", page, count)
-			pageStarted := time.Now()
-			r := scanPage(ctx, file, page, count, o)
-			if err := write(r); err != nil {
-				return err
+			count := pageCounts[file]
+			if count < 0 {
+				continue // Enumeration already failed during the retry pass.
 			}
-			fmt.Fprintf(stderr, "  Page %d/%d: %s (%d findings, %s)\n", page, count, r.Status, len(r.Findings), time.Since(pageStarted).Round(time.Second))
-			if r.Error != "" {
-				fmt.Fprintf(stderr, "    %s\n", r.Error)
+			var err error
+			if count == 0 {
+				count, err = pageCount(ctx, file, o)
+				pageCounts[file] = count
+			}
+			if err != nil {
+				pageCounts[file] = -1
+				fmt.Fprintf(stderr, "  Error counting pages: %v\n", err)
+				retries := checkpoint.pageState(file, 0).retries
+				if checkpoint.pageFailed(file, 0) && ctx.Err() == nil {
+					retries++
+				}
+				r := result{File: file, Status: "error", OCRModel: o.model, Findings: []finding{}, RetryCount: retries, Error: fmt.Sprintf("page enumeration failed: %v; document requires review", err)}
+				markDeadLetter(&r)
+				if err := write(r); err != nil {
+					return err
+				}
+				continue
+			}
+			consecutiveFailures := 0
+			attempted := false
+			for page := 1; page <= count; page++ {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if checkpoint.pageDone(file, page) {
+					if !retrying {
+						fmt.Fprintf(stderr, "  Page %d/%d: skipping completed page or dead letter\n", page, count)
+						skippedPages++
+					}
+					continue
+				}
+				if checkpoint.pageFailed(file, page) != retrying {
+					continue
+				}
+				// Reserve assessment's first request before starting OCR.
+				if o.limit > 0 && o.limit-*o.requests < 2 {
+					limitReached = true
+					break scan
+				}
+				fmt.Fprintf(stderr, "  Page %d/%d\n", page, count)
+				pageStarted := time.Now()
+				retries := checkpoint.pageState(file, page).retries
+				requestRetries := 0
+				var progressErr error
+				pageOptions := o
+				pageOptions.onRetry = func(stage string, attempt int, delay time.Duration, err error) error {
+					requestRetries++
+					pending := result{File: file, Page: page, PageCount: count, Status: "retrying", OCRModel: o.model, AnalysisModel: o.analysisModel,
+						Findings: []finding{}, Error: ollamaFailure(err), RetryCount: retries, RequestRetries: requestRetries, RetryStage: stage, RetryAttempt: attempt, RetryAt: time.Now().UTC().Add(delay)}
+					// Progress records do not count as failed page-processing passes.
+					progressErr = saveResult(enc, report, pending)
+					return progressErr
+				}
+				r := scanPage(ctx, file, page, count, pageOptions)
+				if progressErr != nil {
+					return progressErr
+				}
+				if retrying && r.Status == "error" && ctx.Err() == nil {
+					retries++
+				}
+				r.RetryCount = retries
+				r.RequestRetries = requestRetries
+				if !retrying && ctx.Err() == nil && r.Status == "error" && consecutiveFailures == 2 {
+					r.DocumentStopped = true
+					r.CircuitOpen = failedDocuments == 2
+				}
+				markDeadLetter(&r)
+				if err := write(r); err != nil {
+					return err
+				}
+				fmt.Fprintf(stderr, "  Page %d/%d: %s (%d findings, %s)\n", page, count, r.Status, len(r.Findings), time.Since(pageStarted).Round(time.Second))
+				if r.Error != "" {
+					fmt.Fprintf(stderr, "    %s\n", r.Error)
+				}
+				// Old failures never affect the circuit breaker.
+				if retrying {
+					continue
+				}
+				attempted = true
+				if r.Status == "error" {
+					consecutiveFailures++
+				} else {
+					consecutiveFailures = 0
+				}
+				if consecutiveFailures == 3 {
+					fmt.Fprintln(stderr, "    Three consecutive pages failed: skipping the rest of this document")
+					break
+				}
+			}
+			if !retrying && attempted {
+				if consecutiveFailures == 3 {
+					failedDocuments++
+				} else {
+					failedDocuments = 0
+				}
+				if failedDocuments == 3 {
+					circuitOpen = true
+					break scan
+				}
 			}
 		}
 	}
@@ -435,10 +542,20 @@ scan:
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if circuitOpen {
+		return errors.New("circuit breaker: 3 consecutive documents failed; see error records in the report")
+	}
 	if failed > 0 {
 		return errors.New("scan incomplete: see error records in the report")
 	}
 	return nil
+}
+
+func markDeadLetter(r *result) {
+	if r.Status == "error" && r.RetryCount > 10 {
+		r.DeadLetter = true
+		r.Error += "; dead-lettered after more than 10 retries; automatic retries disabled"
+	}
 }
 
 // Each saved record is a checkpoint independent of graceful shutdown. stdout
@@ -506,6 +623,51 @@ func scanPage(ctx context.Context, file string, page, count int, o options) resu
 }
 
 func (o options) extract(ctx context.Context, encoded, stage, model, prompt string, format json.RawMessage) (string, error) {
+	delays := o.retryDelays
+	if delays == nil {
+		delays = []time.Duration{5 * time.Second, 5 * time.Second, 30 * time.Second, time.Minute, time.Minute}
+	}
+	requestOptions := o
+	for attempt := 0; ; attempt++ {
+		text, err := requestOptions.extractOnce(ctx, encoded, stage, model, prompt, format)
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		var providerError *providers.Error
+		if err == nil || attempt == len(delays) || !errors.As(err, &providerError) ||
+			(!providerError.Retryable && providerError.Kind != providers.ErrorInvalidResponse) {
+			return text, err
+		}
+		// Keep one request available for assessment if OCR recovers.
+		reserve := 0
+		if stage == "OCR" {
+			reserve = 1
+		}
+		if o.limit > 0 && o.requests != nil && o.limit-*o.requests <= reserve {
+			return text, err
+		}
+		// Backoff supplies the inter-request pause on retries.
+		requestOptions.requestDelay = 0
+		delay := max(delays[attempt], o.requestDelay)
+		if o.progress != nil {
+			fmt.Fprintf(o.progress, "    %s failed: %s; retry %d/%d in %s\n", stage, ollamaFailure(err), attempt+1, len(delays), delay)
+		}
+		if o.onRetry != nil {
+			if err := o.onRetry(stage, attempt+1, delay, err); err != nil {
+				return "", err
+			}
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (o options) extractOnce(ctx context.Context, encoded, stage, model, prompt string, format json.RawMessage) (string, error) {
 	// Requests are sequential. Waiting here also spaces requests after failures,
 	// without delaying the durable save of a completed page.
 	if o.requestDelay > 0 {

@@ -26,13 +26,17 @@ var viewerFiles embed.FS
 type reportRow struct {
 	File, Status, Kinds, Details string
 	Page                         int
+	State, Tone, NextAction      string
+	RequestRetries, RetryCount   int
 }
 
 type reportView struct {
-	ID, Directory, Name, Relative, Updated, Problem string
-	Files, CompleteFiles, Pages, Review, Errors     int
-	Partial                                         bool
-	Rows                                            []reportRow
+	ID, Directory, Name, Relative, Updated, Problem                        string
+	Files, CompleteFiles, Pages, Review, Errors                            int
+	Partial                                                                bool
+	Rows                                                                   []reportRow
+	Retrying, RetriedPages, StoppedDocuments, PersistentFiles, DeadLetters int
+	CircuitOpen                                                            bool
 }
 
 type viewerPage struct {
@@ -125,10 +129,19 @@ func viewReport(root, id, path string, all bool) reportView {
 	}
 	// Keep only the latest attempt for each page; never send OCR text to the UI.
 	latest := make(map[string]map[int]result)
+	stopped := make(map[string]bool)
 	c, err := readReport(f, func(r result) {
 		r.Text = ""
+		v.CircuitOpen = r.CircuitOpen
+		stopped[r.File] = r.DocumentStopped
 		if latest[r.File] == nil || r.Page == 0 {
+			previous := latest[r.File]
 			latest[r.File] = make(map[int]result)
+			for page, old := range previous {
+				if old.DeadLetter || (old.Status == "error" && old.RetryCount > 10) {
+					latest[r.File][page] = old
+				}
+			}
 		}
 		if r.Page > 0 {
 			delete(latest[r.File], 0)
@@ -142,11 +155,15 @@ func viewReport(root, id, path string, all bool) reportView {
 	v.Partial = c.partial
 	v.Files = len(c.documents)
 	for file, pages := range latest {
-		if c.fileDone(file) {
-			v.CompleteFiles++
+		complete, persistent := c.fileDone(file), false
+		if stopped[file] {
+			v.StoppedDocuments++
 		}
 		for page, r := range pages {
-			if page > 0 && r.Status != "error" {
+			r.DocumentStopped = r.DocumentStopped && stopped[file]
+			r.CircuitOpen = r.CircuitOpen && v.CircuitOpen
+			r.DeadLetter = r.DeadLetter || (r.Status == "error" && r.RetryCount > 10)
+			if page > 0 && (r.Status == "review" || r.Status == "no_findings") {
 				v.Pages++
 			}
 			if r.Status == "review" {
@@ -154,6 +171,19 @@ func viewReport(root, id, path string, all bool) reportView {
 			}
 			if r.Status == "error" {
 				v.Errors++
+				complete = false
+				persistent = persistent || r.RetryCount > 0 || r.DeadLetter
+			}
+			if r.Status == "retrying" {
+				v.Retrying++
+				complete = false
+				persistent = persistent || r.RetryCount > 0
+			}
+			if r.RequestRetries > 0 {
+				v.RetriedPages++
+			}
+			if r.DeadLetter {
+				v.DeadLetters++
 			}
 			if !all && r.Status == "no_findings" {
 				continue
@@ -171,7 +201,15 @@ func viewReport(root, id, path string, all bool) reportView {
 				}
 				details += "Model reported unreadable text"
 			}
-			v.Rows = append(v.Rows, reportRow{File: r.File, Page: r.Page, Status: r.Status, Kinds: strings.Join(kinds, ", "), Details: details})
+			state, tone, action := resultState(r)
+			v.Rows = append(v.Rows, reportRow{File: r.File, Page: r.Page, Status: r.Status, Kinds: strings.Join(kinds, ", "), Details: details,
+				State: state, Tone: tone, NextAction: action, RequestRetries: r.RequestRetries, RetryCount: r.RetryCount})
+		}
+		if complete {
+			v.CompleteFiles++
+		}
+		if persistent {
+			v.PersistentFiles++
 		}
 	}
 	sort.Slice(v.Rows, func(i, j int) bool {
@@ -181,6 +219,31 @@ func viewReport(root, id, path string, all bool) reportView {
 		return v.Rows[i].File < v.Rows[j].File
 	})
 	return v
+}
+
+func resultState(r result) (state, tone, action string) {
+	switch {
+	case r.DeadLetter:
+		return "Dead letter — investigate", "danger", "More than 10 failed retry passes. Automatic retries are disabled for this page; inspect the document and server logs."
+	case r.Status == "retrying":
+		return "Retrying request", "info", fmt.Sprintf("%s retry %d/5 scheduled for %s. This is the last saved state; an interrupted scan must be resumed.", r.RetryStage, r.RetryAttempt, r.RetryAt.UTC().Format("2006-01-02 15:04:05 UTC"))
+	case r.CircuitOpen:
+		return "Possible upstream issue", "danger", "Three consecutive documents hit the failure threshold. The scan stopped; check Ollama connectivity and server logs before resuming."
+	case r.DocumentStopped:
+		return "Document stopped", "warning", "Three consecutive pages failed. Any remaining pages were deferred to the next run; inspect this document if failures recur."
+	case r.Status == "error" && r.RetryCount > 0:
+		return "Repeated failure — investigate", "warning", "This page has failed on multiple runs. Inspect the document and server logs; it remains eligible for automatic retry."
+	case r.Status == "error" && r.RequestRetries > 0:
+		return "Processing failed after retries", "warning", "This pass included request retries but did not complete. It will be retried first on the next run."
+	case r.Status == "error":
+		return "Processing error", "warning", "Review the error. This page will be retried first on the next run."
+	case r.Status == "review":
+		return "Review", "warning", "Review the findings. Processing completed."
+	case r.RequestRetries > 0:
+		return "Recovered after retries", "success", "The request recovered and processing completed."
+	default:
+		return "No findings", "success", ""
+	}
 }
 
 // Prevent report-controlled cell values from becoming spreadsheet formulas on paste.
