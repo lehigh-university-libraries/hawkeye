@@ -11,9 +11,16 @@ import (
 	"path/filepath"
 )
 
+type pageCheckpoint struct {
+	done       bool
+	retries    int
+	deadLetter bool
+}
+
 type documentCheckpoint struct {
-	count int
-	done  map[int]bool
+	count             int
+	pages             map[int]pageCheckpoint
+	enumerationFailed bool
 }
 
 type reportCheckpoint struct {
@@ -24,15 +31,53 @@ type reportCheckpoint struct {
 	newline    bool
 }
 
+func (c *reportCheckpoint) pageState(file string, page int) pageCheckpoint {
+	if d := c.documents[file]; d != nil {
+		return d.pages[page]
+	}
+	return pageCheckpoint{}
+}
+
 func (c *reportCheckpoint) pageDone(file string, page int) bool {
+	state := c.pageState(file, page)
+	return state.done || state.deadLetter
+}
+
+func (c *reportCheckpoint) hasErrors(file string) bool {
 	d := c.documents[file]
-	return d != nil && d.done[page]
+	if d == nil || c.fileDone(file) {
+		return false
+	}
+	if d.enumerationFailed {
+		return true
+	}
+	for _, state := range d.pages {
+		if !state.done && !state.deadLetter {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *reportCheckpoint) pageFailed(file string, page int) bool {
+	d := c.documents[file]
+	if d == nil {
+		return false
+	}
+	if d.enumerationFailed {
+		return !c.pageDone(file, page)
+	}
+	state, recorded := d.pages[page]
+	return recorded && !state.done && !state.deadLetter
 }
 
 func (c *reportCheckpoint) fileDone(file string) bool {
 	d := c.documents[file]
 	if d == nil {
 		return false
+	}
+	if d.pages[0].deadLetter {
+		return true
 	}
 	count := d.count
 	if count == 0 {
@@ -44,11 +89,11 @@ func (c *reportCheckpoint) fileDone(file string) bool {
 			return false
 		}
 	}
-	if len(d.done) < count {
+	if len(d.pages) < count {
 		return false
 	}
 	for page := 1; page <= count; page++ {
-		if !d.done[page] {
+		if !c.pageDone(file, page) {
 			return false
 		}
 	}
@@ -103,8 +148,8 @@ func readReport(input io.Reader, onRecord func(result)) (*reportCheckpoint, erro
 					err = errors.New("expected one JSON object per line")
 				}
 			}
-			if err != nil || !filepath.IsAbs(r.File) || r.Page < 0 || r.PageCount < 0 || (r.PageCount > 0 && r.Page > r.PageCount) ||
-				(r.Status != "review" && r.Status != "no_findings" && r.Status != "error") || (r.Page == 0 && r.Status != "error") {
+			if err != nil || !filepath.IsAbs(r.File) || r.Page < 0 || r.PageCount < 0 || r.RetryCount < 0 || r.RequestRetries < 0 || (r.PageCount > 0 && r.Page > r.PageCount) ||
+				(r.Status != "review" && r.Status != "no_findings" && r.Status != "error" && r.Status != "retrying") || (r.Page == 0 && r.Status != "error") {
 				// Decoder errors can quote sensitive text. Report only its location.
 				return nil, fmt.Errorf("invalid report record on line %d; report left unchanged", lineNumber)
 			}
@@ -112,7 +157,7 @@ func readReport(input io.Reader, onRecord func(result)) (*reportCheckpoint, erro
 			r.File = file
 			d := c.documents[file]
 			if d == nil {
-				d = &documentCheckpoint{done: make(map[int]bool)}
+				d = &documentCheckpoint{pages: make(map[int]pageCheckpoint)}
 				c.documents[file] = d
 			}
 			if r.PageCount > 0 {
@@ -122,10 +167,15 @@ func readReport(input io.Reader, onRecord func(result)) (*reportCheckpoint, erro
 				d.count = r.PageCount
 			}
 			if r.Page > 0 {
-				d.done[r.Page] = r.Status != "error" && r.Error == ""
+				d.pages[r.Page] = pageCheckpoint{done: (r.Status == "review" || r.Status == "no_findings") && r.Error == "", retries: r.RetryCount, deadLetter: r.DeadLetter || (r.Status == "error" && r.RetryCount > 10)}
 			} else {
-				// A later enumeration failure invalidates older page completions.
-				d.done = make(map[int]bool)
+				// Invalidate older completions, but never resurrect dead letters.
+				for page, state := range d.pages {
+					state.done = false
+					d.pages[page] = state
+				}
+				d.pages[0] = pageCheckpoint{retries: r.RetryCount, deadLetter: r.DeadLetter || r.RetryCount > 10}
+				d.enumerationFailed = true
 			}
 			if onRecord != nil {
 				onRecord(r)

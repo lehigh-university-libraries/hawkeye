@@ -123,3 +123,19 @@ func TestResumeCompletedDirectoryNeedsNoServices(t *testing.T) {
 		t.Fatal("completed directory was not skipped without modifying report")
 	}
 }
+
+func TestDeadLettersSurviveEnumerationFailure(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "pages.pdf")
+	data := reportBytes(t,
+		result{File: file, Page: 1, PageCount: 2, Status: "error", RetryCount: 11, DeadLetter: true},
+		result{File: file, Page: 2, PageCount: 2, Status: "error", RetryCount: 9},
+		result{File: file, Page: 0, Status: "error"},
+	)
+	c, err := readReport(bytes.NewReader(data), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.pageDone(file, 1) || c.pageFailed(file, 1) || !c.pageFailed(file, 2) || c.pageState(file, 2).retries != 9 {
+		t.Fatal("enumeration failure resurrected a dead letter or lost retry counts")
+	}
+}

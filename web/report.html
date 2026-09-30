@@ -2,11 +2,19 @@
 <main id="content"><a class="back" href="/">← All collections</a><div class="intro"><p class="eyebrow">{{.Report.Name}}</p><h1>{{.Report.Directory}}</h1><p>Last saved: {{.Report.Updated}}</p></div>
 {{if .Report.Problem}}<div class="notice error" role="alert">{{.Report.Problem}}</div>{{else}}
 {{if .Report.Partial}}<div class="notice">The final record is incomplete, either from an active write or an interruption. Showing complete records only.</div>{{end}}
+{{if .Report.CircuitOpen}}<div class="notice incident" role="alert"><strong>Scan stopped · possible upstream issue</strong><p>Three consecutive documents each had three consecutive failed pages. Check Ollama connectivity and server logs before resuming. This is a failure pattern, not a confirmed server diagnosis.</p></div>{{end}}
+<section class="failure-modes" aria-label="Failure handling">
+<div class="mode"><h2>Request retries</h2><strong>{{.Report.Retrying}} pending</strong><p>{{.Report.RetriedPages}} pages have request retries in their latest pass. Retryable failures wait 5s, 5s, 30s, 1m, then 1m.</p></div>
+<div class="mode"><h2>Document stops</h2><strong>{{.Report.StoppedDocuments}} documents</strong><p>Three consecutive failed pages defer the rest of a document until the next run.</p></div>
+<div class="mode"><h2>Upstream check</h2><strong>{{if .Report.CircuitOpen}}Scan stopped{{else}}No current circuit stop{{end}}</strong><p>Three consecutive documents hitting that threshold stop the scan. Old failures being retried do not count.</p></div>
+<div class="mode"><h2>Persistent failures</h2><strong>{{.Report.PersistentFiles}} documents to investigate</strong><p>{{.Report.DeadLetters}} dead-lettered pages or file errors. After 11 failed retry passes across runs, automatic retries stop.</p></div>
+</section>
+<p class="note">These are saved states, not a live connection to the scanner. A pending retry can remain here after an interruption. Request retries happen within a pass; failed retry passes count across runs.</p>
 <section class="metrics" aria-label="Saved progress"><div><strong>{{.Report.CompleteFiles}}</strong><span>complete files</span></div><div><strong>{{.Report.Pages}}</strong><span>scanned pages</span></div><div><strong>{{.Report.Review}}</strong><span>pages to review</span></div><div><strong>{{.Report.Errors}}</strong><span>processing errors</span></div></section>
-<p class="note">{{.Report.Files}} files have saved records. Unseen files are not counted. “Complete” means processing finished, including files needing review.</p>
+<p class="note">{{.Report.Files}} files have saved records. Unseen files are not counted. “Complete” means all pages were processed successfully, including pages needing review. Dead letters remain errors and are not complete.</p>
 <div class="toolbar"><nav aria-label="Page filter"><a {{if not .All}}aria-current="page"{{end}} href="/report?id={{.Report.ID}}">Needs attention</a><a {{if .All}}aria-current="page"{{end}} href="/report?id={{.Report.ID}}&amp;all=1">All saved pages</a></nav><button type="button" id="copy-table">Copy table for Sheets</button><span id="copy-status" role="status"></span></div>
-<div class="table-wrap"><table id="results"><thead><tr><th>File</th><th>Page</th><th>Status</th><th>Findings</th><th>Details</th></tr></thead><tbody>
-{{range .Report.Rows}}<tr><td class="file">{{cell .File}}</td><td>{{.Page}}</td><td>{{if eq .Status "review"}}Review{{else if eq .Status "error"}}Processing error{{else}}No findings{{end}}</td><td>{{cell .Kinds}}</td><td>{{cell .Details}}</td></tr>{{end}}
+<div class="table-wrap"><table id="results"><thead><tr><th>File</th><th>Page</th><th>Status</th><th>Request retries</th><th>Failed retry passes</th><th>Findings / next action</th></tr></thead><tbody>
+{{range .Report.Rows}}<tr><td class="file">{{cell .File}}</td><td>{{.Page}}</td><td><span class="status {{.Tone}}">{{.State}}</span></td><td class="number">{{.RequestRetries}}</td><td class="number">{{.RetryCount}}</td><td class="details">{{if .Kinds}}<strong>{{cell .Kinds}}</strong>{{end}}{{if .Details}}<p>{{cell .Details}}</p>{{end}}{{if .NextAction}}<p class="next-action">{{cell .NextAction}}</p>{{end}}</td></tr>{{end}}
 </tbody></table></div>{{if not .Report.Rows}}<p class="empty">No saved pages match this view.</p>{{end}}
 <p class="note">Page numbers start at 1; page 0 indicates a file-level processing error. The latest attempt replaces earlier results in this view. OCR text and original documents are not served.</p>
 {{end}}</main>{{template "foot" .}}

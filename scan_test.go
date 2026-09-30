@@ -255,7 +255,7 @@ func TestDockerPipeline(t *testing.T) {
 	if err := os.WriteFile(pdf, syntheticPDF(), 0600); err != nil {
 		t.Fatal(err)
 	}
-	o := options{depth: -1, dpi: 100, maxEdge: 1200, timeout: time.Minute, image: envDefault("HAWKEYE_TEST_IMAGE", defaultImage), model: "glm-ocr:bf16", analysisModel: "qwen3.5:latest", output: filepath.Join(dir, "report.jsonl")}
+	o := options{retryDelays: []time.Duration{}, depth: -1, dpi: 100, maxEdge: 1200, timeout: time.Minute, image: envDefault("HAWKEYE_TEST_IMAGE", defaultImage), model: "glm-ocr:bf16", analysisModel: "qwen3.5:latest", output: filepath.Join(dir, "report.jsonl")}
 	count, err := pageCount(context.Background(), pdf, o)
 	if err != nil || count != 2 {
 		t.Fatalf("page count %d: %v", count, err)
@@ -658,7 +658,7 @@ func TestPageAssessmentAndFailures(t *testing.T) {
 			}))
 			defer server.Close()
 			t.Setenv("OLLAMA_URL", server.URL)
-			got := scanPage(ctx, input, 1, 1, options{model: "test-ocr", analysisModel: "test-analysis", houdiniURL: server.URL + "/image", timeout: time.Second, includeText: tc.includeText, noRegex: tc.noRegex})
+			got := scanPage(ctx, input, 1, 1, options{retryDelays: []time.Duration{}, model: "test-ocr", analysisModel: "test-analysis", houdiniURL: server.URL + "/image", timeout: time.Second, includeText: tc.includeText, noRegex: tc.noRegex})
 			wantCalls := int32(2)
 			if tc.text == "" {
 				wantCalls = 1 // HTR rejects an empty response before assessment.
@@ -732,7 +732,7 @@ func TestRequestDelay(t *testing.T) {
 	encoded := base64.StdEncoding.EncodeToString(testPNG(t))
 	for i, stage := range []string{"OCR", "Assessment", "OCR"} {
 		started := time.Now()
-		_, err := o.extract(context.Background(), encoded, stage, "test", "test", nil)
+		_, err := o.extractOnce(context.Background(), encoded, stage, "test", "test", nil)
 		if (err != nil) != (i == 0) {
 			t.Fatalf("request %d: %v", i, err)
 		}
@@ -746,7 +746,7 @@ func TestRequestDelay(t *testing.T) {
 	o.requestDelay = time.Hour
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if _, err := o.extract(ctx, encoded, "OCR", "test", "test", nil); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := o.extractOnce(ctx, encoded, "OCR", "test", "test", nil); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("wait did not return context error: %v", err)
 	}
 	if calls.Load() != 3 {

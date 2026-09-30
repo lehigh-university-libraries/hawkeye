@@ -197,6 +197,8 @@ the entire document needs review. Status values:
 - `review`: rules or model flagged a candidate, OCR was empty, or the model
   reported unreadable text.
 - `no_findings`: processing completed without a flag; this is not a safety claim.
+- `retrying`: an OCR or assessment request is waiting for a backoff retry. This
+  is an intermediate checkpoint, not a completed page or a failed retry pass.
 - `error`: enumeration, rendering, OCR, or assessment failed; review or retry.
   Preparation errors include the cause (such as Houdini's HTTP status or Docker's
   exit status), without recording HTTP response bodies or conversion stderr.
@@ -204,6 +206,11 @@ the entire document needs review. Status values:
 Reports are created with mode `0600` and appended record by record. Passing an
 existing output file resumes that report. Each record is synced to disk before
 progress marks the page complete; the JSONL file itself is the checkpoint.
+Retry waits also append a synced record, with `retry_stage`, `retry_attempt`,
+`retry_at`, and the current pass's `request_retries` count. The final page result
+replaces that intermediate state in the viewer. Request retry counts include a
+scheduled retry that has not yet run. Document and scan stops are saved on the
+triggering page as `document_stopped` and `circuit_open`.
 This does not depend on shutdown handlers running. A failed write or sync stops
 the scan immediately. `-o -` writes JSONL to stdout; progress
 and a final count go to stderr. The `text` field retains OCR text by default,
@@ -255,7 +262,7 @@ To process a bounded batch, keep the same report and request limit on each run:
 ```
 
 `--limit` caps Ollama inference attempts in this invocation, including failed
-attempts. OCR and assessment each count as one, so 500 normally completes 250
+attempts and backoff retries. OCR and assessment each count as one, so 500 normally completes 250
 pages. Capability checks, Docker/Houdini operations, and skipped pages do not
 count. Hawkeye starts a page only when at least two requests remain, saves its
 result, and stops before exceeding the limit. An odd limit may leave one request
@@ -264,8 +271,37 @@ Reaching the limit is a normal exit; processing errors still cause a nonzero
 exit. Rerun the command to skip completed pages and retry errors or scan the
 remaining pages. A report written to stdout (`-o -`) cannot be resumed.
 
+Transient Ollama failures (including HTTP 500 and `invalid_response` with HTTP
+200) receive up to five retries, waiting **5s, 5s, 30s, 1m, 1m**. This applies to
+both OCR and assessment requests. Backoff replaces the normal request pause;
+a longer `--request-delay` still takes precedence. Cancellation interrupts the
+wait, and retries respect `--limit`, reserving one request for assessment while
+retrying OCR. Permanent errors such as authentication failures are not retried
+within a pass.
+
+When resuming, Hawkeye retries previously failed pages **before scanning any new
+pages**. `--retry-errors` explicitly requests this same behavior and requires an
+existing output report; it is implied when resuming. Each failed retry pass
+increments the page's saved `retry_count` once, regardless of how many backoff
+requests it used. The initial failed pass has count zero. After **11 failed
+retry passes** (more than 10), the record is marked `dead_letter: true` and is
+never automatically retried from that report. Dead letters remain error records
+for review. Interrupted passes do not increment the count. Counts are saved with
+the page result, so a hard kill before that checkpoint can lose the current pass.
+Older records without a count start at zero. A document enumeration failure uses
+the same counter on its page-zero record.
+
+For new work, **three consecutive failed pages** skip the rest of that document.
+If **three consecutive documents** hit that threshold, Hawkeye saves the last
+page result and exits with an error. A successful page resets the page streak;
+a processed document that does not hit the threshold resets the document streak.
+Old failures being retried do not count toward either threshold. Documents with
+fewer than three attempted pages cannot hit the threshold. Skipped pages remain
+unprocessed and are picked up on the next run.
+
 Resume keys are absolute file paths and one-based page numbers. The latest
-`review` or `no_findings` record completes a page; `error` records are retried.
+`review` or `no_findings` record completes a page; `error` records are retried
+unless dead-lettered.
 A review finding is a completed scan, not a processing failure. New files are
 scanned, and successful pages in partially scanned PDFs/TIFFs are skipped.
 New records include `page_count`, allowing fully completed multipage files to
@@ -320,6 +356,21 @@ processing errors, using the latest attempt for each page. Counts reflect
 saved records, not an overall percentage: the report does not list inputs
 that have not yet produced a record. A timestamp shows the last saved update;
 an old timestamp cannot establish whether a scanner is still running.
+
+The dashboard distinguishes four failure modes: request retries, document stops,
+possible upstream trouble, and persistent failures across runs. It shows pending
+retry times, request retry counts within the latest pass, failed retry passes
+across runs, and a next action for each affected page. A circuit break displays
+a scan-stopped notice; a later saved record clears that notice. Document stops
+remain shown until that document produces another record. These are saved
+observations, not a live health check or a confirmed diagnosis of the server.
+Old reports without the new stop metadata do not imply a circuit break.
+
+Repeated failures are marked for investigation before they reach the dead-letter
+threshold. Dead letters remain visible as errors with automatic retries disabled;
+they do not count as completed files. Successful recoveries appear under
+**All saved pages**. Interrupted request retries remain unfinished and are
+eligible for retry on resume without adding a failed pass to their count.
 
 The default table shows pages needing attention. Switch to **All saved pages**
 to include negative results. **Copy table for Sheets** copies an HTML table and
