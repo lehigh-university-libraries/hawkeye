@@ -3,7 +3,7 @@ module github.com/lehigh-university-libraries/hawkeye
 go 1.26.3
 
 require (
-	github.com/lehigh-university-libraries/htr v0.20.0
+	github.com/lehigh-university-libraries/htr v0.24.0
 	github.com/spf13/cobra v1.10.2
 )
 
