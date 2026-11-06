@@ -172,3 +172,36 @@ func TestViewerRetainsDeadLettersAfterEnumerationFailure(t *testing.T) {
 		t.Fatalf("lost dead letter: %+v", v)
 	}
 }
+
+func TestViewerFindingConfidence(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "report.jsonl")
+	file := filepath.Join(root, "document.pdf")
+	data := reportBytes(t,
+		result{File: file, Page: 1, PageCount: 2, Status: "review", Findings: []finding{{Kind: "ssn", Source: "model"}}},
+		result{File: file, Page: 2, PageCount: 2, Status: "review", Findings: []finding{{Kind: "credit_card", Source: "rules"}, {Kind: "credit_card", Source: "model"}}},
+	)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	v := viewReport(root, "test", path, false)
+	if len(v.Rows) != 2 || v.Rows[0].Confidence != "weak" || v.Rows[1].Confidence != "strong" || v.Rows[1].Sources != "model, rules" {
+		t.Fatalf("unexpected confidence: %+v", v.Rows)
+	}
+	handler, err := reportHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := findReports(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id := range paths {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/report?id="+id+"&sort=confidence", nil))
+		body := response.Body.String()
+		if response.Code != 200 || !strings.Contains(body, "model, rules") || strings.Index(body, ">strong<") > strings.Index(body, ">weak<") {
+			t.Fatalf("confidence sorting failed: %s", body)
+		}
+	}
+}

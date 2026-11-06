@@ -7,7 +7,7 @@ fmt-check:
 	@test -z "$$(gofmt -l *.go)" || { gofmt -l *.go; exit 1; }
 
 lint: fmt-check
-	golangci-lint run
+	GOTOOLCHAIN=go$$(awk '$$1 == "go" { print $$2; exit }' go.mod) golangci-lint run
 
 test:
 	go test -race ./...

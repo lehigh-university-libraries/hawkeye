@@ -21,6 +21,7 @@ type documentCheckpoint struct {
 	count             int
 	pages             map[int]pageCheckpoint
 	enumerationFailed bool
+	ssnContext        bool
 }
 
 type reportCheckpoint struct {
@@ -159,6 +160,9 @@ func readReport(input io.Reader, onRecord func(result)) (*reportCheckpoint, erro
 			if d == nil {
 				d = &documentCheckpoint{pages: make(map[int]pageCheckpoint)}
 				c.documents[file] = d
+			}
+			if r.SSNContext || ssnLabelPattern.MatchString(r.Text) {
+				d.ssnContext = true
 			}
 			if r.PageCount > 0 {
 				if d.count != 0 && d.count != r.PageCount {

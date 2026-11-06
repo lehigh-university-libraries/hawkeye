@@ -383,13 +383,16 @@ documents are not served. The application accepts only read requests.
 
 ```sh
 make build
-make lint               # golangci-lint v2.13.2
+make lint               # golangci-lint v2.14.0
 make test
 make test-integration   # requires Docker
 make release-check      # GoReleaser v2.18.2, inside a Git checkout
 govulncheck ./...
 gosec -quiet ./...
 ```
+
+`make lint` selects the Go version in `go.mod` so that the linter analyzes a
+compatible standard library; Go may download that toolchain on first use.
 
 The Docker integration check uses synthetic two-page PDF and TIFF documents and
 a local mock Ollama server. It checks distinct page rendering, HTR API requests,

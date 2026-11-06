@@ -25,6 +25,7 @@ var viewerFiles embed.FS
 
 type reportRow struct {
 	File, Status, Kinds, Details string
+	Sources, Confidence          string
 	Page                         int
 	State, Tone, NextAction      string
 	RequestRetries, RetryCount   int
@@ -156,6 +157,14 @@ func viewReport(root, id, path string, all bool) reportView {
 	v.Files = len(c.documents)
 	for file, pages := range latest {
 		complete, persistent := c.fileDone(file), false
+		hasSSN := false
+		for _, r := range pages {
+			for _, f := range r.Findings {
+				if f.Kind == "ssn" {
+					hasSSN = true
+				}
+			}
+		}
 		if stopped[file] {
 			v.StoppedDocuments++
 		}
@@ -188,14 +197,44 @@ func viewReport(root, id, path string, all bool) reportView {
 			if !all && r.Status == "no_findings" {
 				continue
 			}
-			var kinds []string
+			var kinds, sources []string
+			byKind := make(map[string]map[string]bool)
+			strong := false
 			for _, finding := range r.Findings {
 				kinds = append(kinds, finding.Kind)
+				sources = append(sources, finding.Source)
+				if byKind[finding.Kind] == nil {
+					byKind[finding.Kind] = make(map[string]bool)
+				}
+				byKind[finding.Kind][finding.Source] = true
+				if finding.Context && (finding.Kind == "credit_card" || finding.Kind == "routing_number") {
+					strong = true
+				}
+			}
+			for _, source := range byKind {
+				if source["rules"] && source["model"] {
+					strong = true
+				}
+			}
+			sort.Strings(sources)
+			sources = slices.Compact(sources)
+			confidence := ""
+			if len(r.Findings) > 0 {
+				confidence = "weak"
+				if strong {
+					confidence = "strong"
+				}
 			}
 			sort.Strings(kinds)
 			kinds = slices.Compact(kinds)
 			details := r.Error
-			if r.Assessment != nil && r.Assessment.Readable != nil && !*r.Assessment.Readable {
+			if hasSSN && !slices.Contains(kinds, "ssn") {
+				if details != "" {
+					details += "; "
+				}
+				details += "Another page in this document has an SSN finding"
+			}
+			if r.Assessment != nil && r.Assessment.Readable != nil && !*r.Assessment.Readable && !r.NoText {
 				if details != "" {
 					details += "; "
 				}
@@ -203,7 +242,7 @@ func viewReport(root, id, path string, all bool) reportView {
 			}
 			state, tone, action := resultState(r)
 			v.Rows = append(v.Rows, reportRow{File: r.File, Page: r.Page, Status: r.Status, Kinds: strings.Join(kinds, ", "), Details: details,
-				State: state, Tone: tone, NextAction: action, RequestRetries: r.RequestRetries, RetryCount: r.RetryCount})
+				State: state, Tone: tone, NextAction: action, Sources: strings.Join(sources, ", "), Confidence: confidence, RequestRetries: r.RequestRetries, RetryCount: r.RetryCount})
 		}
 		if complete {
 			v.CompleteFiles++
@@ -311,7 +350,22 @@ func reportHandler(root string) (http.Handler, error) {
 			return
 		}
 		all := r.URL.Query().Get("all") == "1"
-		render(w, "report.html", viewerPage{Report: viewReport(root, id, path, all), All: all})
+		view := viewReport(root, id, path, all)
+		if r.URL.Query().Get("sort") == "confidence" {
+			sort.SliceStable(view.Rows, func(i, j int) bool {
+				rank := func(s string) int {
+					if s == "strong" {
+						return 0
+					}
+					if s == "weak" {
+						return 1
+					}
+					return 2
+				}
+				return rank(view.Rows[i].Confidence) < rank(view.Rows[j].Confidence)
+			})
+		}
+		render(w, "report.html", viewerPage{Report: view, All: all})
 	})
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
