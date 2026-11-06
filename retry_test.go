@@ -26,7 +26,7 @@ func TestOllamaBackoff(t *testing.T) {
 	}{
 		{"500 recovers", 500, 2, 0, 3, "OCR", false},
 		{"network disconnect recovers", 0, 2, 0, 3, "OCR", false},
-		{"invalid response recovers", 200, 1, 0, 2, "OCR", false},
+		{"invalid assessment response recovers", 200, 1, 0, 2, "Assessment", false},
 		{"exhausted", 500, 99, 0, 6, "OCR", true},
 		{"assessment retries", 500, 1, 0, 2, "Assessment", false},
 		{"permanent error", 401, 99, 0, 1, "OCR", true},
@@ -384,5 +384,41 @@ func TestRetryProgressSaveFailureStopsRequests(t *testing.T) {
 	_, err := o.extract(context.Background(), base64.StdEncoding.EncodeToString(testPNG(t)), "OCR", "test", "test", nil)
 	if err != saveErr || calls.Load() != 1 {
 		t.Fatalf("err=%v calls=%d", err, calls.Load())
+	}
+}
+
+func TestEmptyOCRDoesNotStopDocument(t *testing.T) {
+	dir, o, _, _ := retryScanSetup(t, 4, 1)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/show" {
+			_, _ = io.WriteString(w, `{"capabilities":["vision"]}`)
+			return
+		}
+		var request struct{ Model string }
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+		}
+		calls.Add(1)
+		response := ""
+		if request.Model == "assessment" {
+			response = negativeAssessment
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"response": response})
+	}))
+	defer server.Close()
+	t.Setenv("OLLAMA_URL", server.URL)
+	o.endpoint = server.URL
+	if err := run(context.Background(), dir, o, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	records := scanRecords(t, o.output)
+	if len(records) != 4 || calls.Load() != 8 {
+		t.Fatalf("records=%d calls=%d", len(records), calls.Load())
+	}
+	for _, r := range records {
+		if r.Status != "no_findings" || !r.NoText || r.DocumentStopped || r.CircuitOpen || r.RequestRetries != 0 {
+			t.Fatalf("unexpected record: %+v", r)
+		}
 	}
 }

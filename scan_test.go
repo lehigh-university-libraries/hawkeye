@@ -140,7 +140,20 @@ func TestDetection(t *testing.T) {
 		{"⑆021000021⑆ 123456789⑈", "bank_number_candidate"},
 		{"Routing: 021000021", "routing_number"},
 		{"SSN 123-45-6789", "ssn"},
+		{"123 – 45 – 6789", "ssn"},
+		{"Social Security\n123456789", "ssn"},
+		{"123-45-6789\n234-56-7890", "ssn"},
 		{"Card 4111 1111 1111 1111", "credit_card"},
+		{"Visa 4111  1111  1111  1111", ""},
+		{"Total 12345 678 901 2345", ""},
+		{"18015-1234", ""},
+		{"Bank phone 610-555-0123", ""},
+		{"Bank phone (610) 555-0123", ""},
+		{"Account (610) 555-0123", "bank_account"},
+		{"Bank 021000021", "routing_number"},
+		{"021000021", ""},
+		{"3915101219158", ""},
+		{"39151 01219 158", ""},
 		{"Call 610-555-0123. Address: 123 Main Street.", ""},
 		{"000-00-0000 999-99-9999 0000 0000 0000 0000", ""},
 	} {
@@ -598,8 +611,12 @@ func TestPageAssessmentAndFailures(t *testing.T) {
 		includeText, noRegex           bool
 	}{
 		{"no findings", "A letter about the garden.", "", "no_findings", false, false},
-		{"empty OCR", "", "", "error", true, false},
+		{"empty OCR", "", `{"contains_sensitive":false,"readable":false,"sensitive_likelihood_percent":0,"kinds":[]}`, "no_findings", true, false},
+		{"empty OCR with finding", "", `{"contains_sensitive":true,"readable":false,"sensitive_likelihood_percent":80,"kinds":["credit_card"]}`, "review", true, false},
 		{"include text", "A letter about the garden.", "", "no_findings", true, false},
+		{"page one card without context", "4111111111111111", "", "no_findings", true, false},
+		{"page one card with context", "Visa 4111111111111111", "", "review", true, false},
+		{"page one model agreement", "4111111111111111", `{"contains_sensitive":true,"readable":true,"sensitive_likelihood_percent":80,"kinds":["credit_card"]}`, "review", true, false},
 		{"visual finding", "Unremarkable OCR.", `{"contains_sensitive":true,"readable":true,"sensitive_likelihood_percent":80,"kinds":["bank_account"]}`, "review", true, false},
 		{"rules survive model negative", "Account number: 12345678", "", "review", true, false},
 		{"unreadable", "Some text", `{"contains_sensitive":false,"readable":false,"sensitive_likelihood_percent":0,"kinds":[]}`, "review", false, false},
@@ -660,11 +677,8 @@ func TestPageAssessmentAndFailures(t *testing.T) {
 			t.Setenv("OLLAMA_URL", server.URL)
 			got := scanPage(ctx, input, 1, 1, options{retryDelays: []time.Duration{}, model: "test-ocr", analysisModel: "test-analysis", houdiniURL: server.URL + "/image", timeout: time.Second, includeText: tc.includeText, noRegex: tc.noRegex})
 			wantCalls := int32(2)
-			if tc.text == "" {
-				wantCalls = 1 // HTR rejects an empty response before assessment.
-				if !strings.Contains(got.Error, "invalid_response") {
-					t.Fatalf("missing empty-response diagnostic: %s", got.Error)
-				}
+			if got.NoText != (tc.text == "") {
+				t.Fatalf("incorrect no_text: %+v", got)
 			}
 			if calls.Load() != wantCalls {
 				t.Fatalf("expected %d model calls, got %d", wantCalls, calls.Load())
@@ -907,5 +921,16 @@ func TestTextOnlyModelStopsBeforeScanning(t *testing.T) {
 				t.Fatalf("report created before model validation: %v", err)
 			}
 		})
+	}
+}
+
+func TestDocumentSSNContext(t *testing.T) {
+	if len(detectWithContext("123456789", false)) != 0 || len(detectWithContext("123456789", true)) != 1 {
+		t.Fatal("bare SSN should require document context")
+	}
+	input := strings.NewReader(`{"file":"/test.pdf","page":1,"page_count":2,"status":"no_findings","ssn_context":true}` + "\n")
+	checkpoint, err := readReport(input, nil)
+	if err != nil || !checkpoint.documents["/test.pdf"].ssnContext {
+		t.Fatalf("context not restored: %v", err)
 	}
 }

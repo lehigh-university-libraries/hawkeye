@@ -31,7 +31,7 @@ type options struct {
 	endpoint, model, analysisModel, image, houdiniURL, output string
 	timeout, requestDelay                                     time.Duration
 	includeText, noRegex                                      bool
-	retryErrors                                               bool
+	retryErrors, ssnContext                                   bool
 	retryDelays                                               []time.Duration
 	onRetry                                                   func(stage string, attempt int, delay time.Duration, err error) error
 	progress                                                  io.Writer
@@ -137,6 +137,8 @@ type result struct {
 	OCRModel        string      `json:"ocr_model"`
 	AnalysisModel   string      `json:"analysis_model,omitempty"`
 	Text            string      `json:"text,omitempty"`
+	NoText          bool        `json:"no_text,omitempty"`
+	SSNContext      bool        `json:"ssn_context,omitempty"`
 	Findings        []finding   `json:"findings"`
 	Assessment      *assessment `json:"assessment,omitempty"`
 	Error           string      `json:"error,omitempty"`
@@ -472,6 +474,9 @@ scan:
 				requestRetries := 0
 				var progressErr error
 				pageOptions := o
+				if doc := checkpoint.documents[file]; doc != nil {
+					pageOptions.ssnContext = doc.ssnContext
+				}
 				pageOptions.onRetry = func(stage string, attempt int, delay time.Duration, err error) error {
 					requestRetries++
 					pending := result{File: file, Page: page, PageCount: count, Status: "retrying", OCRModel: o.model, AnalysisModel: o.analysisModel,
@@ -481,6 +486,12 @@ scan:
 					return progressErr
 				}
 				r := scanPage(ctx, file, page, count, pageOptions)
+				if r.SSNContext {
+					if checkpoint.documents[file] == nil {
+						checkpoint.documents[file] = &documentCheckpoint{pages: make(map[int]pageCheckpoint)}
+					}
+					checkpoint.documents[file].ssnContext = true
+				}
 				if progressErr != nil {
 					return progressErr
 				}
@@ -595,11 +606,10 @@ func scanPage(ctx context.Context, file string, page, count int, o options) resu
 		r.Text = text
 	}
 	if !o.noRegex {
-		r.Findings = detect(text)
+		r.Findings = detectWithContext(text, o.ssnContext)
 	}
-	if strings.TrimSpace(text) == "" {
-		r.Findings = append(r.Findings, finding{Kind: "empty_ocr", Source: "ocr"})
-	}
+	r.NoText = strings.TrimSpace(text) == ""
+	r.SSNContext = ssnLabelPattern.MatchString(text)
 	quoted, _ := json.Marshal(text) // A string is always JSON-encodable.
 	raw, err := o.extract(ctx, encoded, "Assessment", o.analysisModel, analysisPrompt+string(quoted), json.RawMessage(assessmentSchema))
 	if err != nil {
@@ -612,11 +622,16 @@ func scanPage(ctx context.Context, file string, page, count int, o options) resu
 		o.debug("Model response validation failed", "page", page, "model", o.analysisModel, "error", err.Error())
 		return r
 	}
+	if page == 1 && !slices.Contains(r.Assessment.Kinds, "credit_card") {
+		r.Findings = slices.DeleteFunc(r.Findings, func(f finding) bool {
+			return f.Source == "rules" && f.Kind == "credit_card" && !f.Context
+		})
+	}
 	for _, kind := range r.Assessment.Kinds {
 		r.Findings = append(r.Findings, finding{Kind: kind, Source: "model"})
 	}
 	r.Status = "no_findings"
-	if len(r.Findings) > 0 || *r.Assessment.ContainsSensitive || !*r.Assessment.Readable {
+	if len(r.Findings) > 0 || *r.Assessment.ContainsSensitive || (!r.NoText && !*r.Assessment.Readable) {
 		r.Status = "review"
 	}
 	return r
@@ -634,6 +649,10 @@ func (o options) extract(ctx context.Context, encoded, stage, model, prompt stri
 			return "", ctx.Err()
 		}
 		var providerError *providers.Error
+		// HTR currently conflates an empty OCR response with malformed HTTP 200 JSON.
+		if stage == "OCR" && errors.As(err, &providerError) && providerError.Kind == providers.ErrorInvalidResponse && providerError.StatusCode == http.StatusOK {
+			return "", nil
+		}
 		if err == nil || attempt == len(delays) || !errors.As(err, &providerError) ||
 			(!providerError.Retryable && providerError.Kind != providers.ErrorInvalidResponse) {
 			return text, err
